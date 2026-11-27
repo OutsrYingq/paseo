@@ -46,6 +46,21 @@ const RecordSchema = z.object({
 });
 type Record = z.infer<typeof RecordSchema>;
 
+export interface CreationFiles {
+  prepare(directory: string): Promise<unknown>;
+  read(file: string): Promise<string | null>;
+  write(file: string, contents: string): Promise<void>;
+  claim(file: string, identity: string): Promise<void>;
+}
+
+const localCreationFiles: CreationFiles = {
+  prepare: (directory) => mkdir(directory, { recursive: true }),
+  read: readOptional,
+  write: writeFileAtomic,
+  claim: (file, identity) =>
+    writeFile(file, identity, { flag: "wx", mode: 0o600 }),
+};
+
 /** Owns creation across socket lifetimes. Resource owners perform work; this module commits its milestones. */
 export class CreationService {
   private admission: Promise<unknown> = Promise.resolve();
@@ -59,12 +74,13 @@ export class CreationService {
       snapshot: CreationSnapshot,
     ) => Promise<void> = async () => {},
     private readonly legacyDirectory?: string,
+    private readonly files = localCreationFiles,
   ) {}
 
   async create(input: CreationInput, observer?: Observer): Promise<CreationSnapshot> {
     const identity = identityFor(input.kind, input.key);
     const admitted = this.admission.then(async () => {
-      await mkdir(this.directory, { recursive: true });
+      await this.files.prepare(this.directory);
       const fingerprint = digest(input.request);
       let record = await this.read(identity);
       if (!record) record = await this.readLegacyAgent(input, fingerprint);
@@ -221,7 +237,7 @@ export class CreationService {
   // Import the previous receipt format; it is never a second execution path.
   private async readLegacyAgent(input: CreationInput, fingerprint: string): Promise<Record | null> {
     if (input.kind !== "agent" || !this.legacyDirectory) return null;
-    const text = await readOptional(
+    const text = await this.files.read(
       join(this.legacyDirectory, `${digest(["create", input.key])}.json`),
     );
     if (text === null) return null;
@@ -267,13 +283,13 @@ export class CreationService {
     exists: CreationInput["exists"],
   ): Promise<void> {
     const file = join(this.directory, `${digest([kind, id])}.claim`);
-    const owner = await readOptional(file);
+    const owner = await this.files.read(file);
     if (owner !== null) {
       if (owner !== identity) throw new Error(`${kind}_id_conflict`);
       return;
     }
     if (await exists(kind, id)) throw new Error(`${kind}_id_conflict`);
-    await writeFile(file, identity, { flag: "wx", mode: 0o600 });
+    await this.files.claim(file, identity);
   }
   private observe(identity: string, observer: Observer): () => void {
     const observers = this.observers.get(identity) ?? new Set<Observer>();
@@ -313,12 +329,12 @@ export class CreationService {
     // Serialize now: the runner mutates the record after queueing this write.
     const contents = JSON.stringify(record, null, 2);
     return this.accessReceipt(identity, () =>
-      writeFileAtomic(join(this.directory, `${identity}.json`), contents),
+      this.files.write(join(this.directory, `${identity}.json`), contents),
     );
   }
   private read(identity: string): Promise<Record | null> {
     return this.accessReceipt(identity, async () => {
-      const text = await readOptional(join(this.directory, `${identity}.json`));
+      const text = await this.files.read(join(this.directory, `${identity}.json`));
       return text === null ? null : RecordSchema.parse(JSON.parse(text));
     });
   }

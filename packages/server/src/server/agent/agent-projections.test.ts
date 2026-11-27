@@ -133,6 +133,19 @@ function createPermission(overrides: Partial<AgentPermissionRequest> = {}): Agen
 }
 
 describe("toStoredAgentRecord", () => {
+  it("keeps empty objects in opaque plugin persistence", () => {
+    const persistence = { version: 2, data: { key: "fixture", assets: {}, slots: [{}] } };
+    const record = toStoredAgentRecord(
+      createManagedAgent({
+        persistence: {
+          provider: "fixture",
+          sessionId: `plugin:${JSON.stringify(persistence)}`,
+          metadata: { pluginProviderPersistence: persistence, other: {} },
+        },
+      }),
+    );
+    expect(record.persistence?.metadata).toEqual({ pluginProviderPersistence: persistence });
+  });
   it("captures lifecycle metadata, config, and persistence", () => {
     const agent = createManagedAgent({
       currentModeId: "focus",
