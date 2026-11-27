@@ -82,6 +82,7 @@ export interface OmpHistoryReplay {
 export async function* streamOmpHistory(input: {
   sessionFile?: string;
   runtimeSession?: OmpRuntimeSession;
+  activeBranchEntryId?: string;
   provider: AgentProvider;
   bridgedTools?: ReadonlyMap<string, OmpBridgedToolIdentity>;
   visitedSessionFiles?: Set<string>;
@@ -99,7 +100,7 @@ export async function* streamOmpHistory(input: {
   try {
     entries = await readActiveOmpEntryChain(
       input.sessionFile,
-      input.runtimeSession?.activeBranchEntryId,
+      input.activeBranchEntryId ?? input.runtimeSession?.activeBranchEntryId,
     );
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {

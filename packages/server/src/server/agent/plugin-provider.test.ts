@@ -3063,6 +3063,31 @@ test("plugin provider import keeps the stats the plugin reported with its histor
   }
 });
 
+test("replays the complete encoded plugin handle when legacy metadata dropped empty fields", async () => {
+  const harness = createProviderHarness();
+  const plugins = new PluginAgentClientRegistry(createTestLogger());
+  plugins.replace([harness.registration]);
+  const provider = harness.registration.id;
+  try {
+    const persistence = { version: 2, data: { token: "root", assets: {} } };
+    const session = await plugins.clients()[provider]!.resumeSession(
+      {
+        provider,
+        sessionId: `plugin:${JSON.stringify(persistence)}`,
+        metadata: { pluginProviderPersistence: { version: 2, data: { token: "root" } } },
+      },
+      { provider, cwd: "/project" },
+    );
+    expect(harness.inputs.findLast((input) => input.type === "session.open")).toMatchObject({
+      history: "replay",
+      persistence,
+    });
+    await session.close();
+  } finally {
+    await plugins.shutdown();
+  }
+});
+
 test.each(["goose", "hermes"])(
   "resumes a %s session saved by the generic ACP provider",
   async (provider) => {

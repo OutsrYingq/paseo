@@ -105,6 +105,7 @@ export interface RegisteredProviderDefinition extends AgentProviderDefinition {
 }
 
 export interface BuildProviderRegistryOptions {
+  executionProviderIds?: ReadonlySet<string>;
   pluginProviders?: Record<string, RegisteredProviderDefinition>;
   runtimeSettings?: AgentProviderRuntimeSettingsMap;
   providerOverrides?: Record<string, ProviderOverride>;
@@ -942,6 +943,13 @@ export function buildProviderRegistry(
     },
     options?.isDev === true,
   );
+  if (options?.executionProviderIds) {
+    for (const provider of resolvedProviders.keys()) {
+      if (!options.executionProviderIds.has(provider) || options.pluginProviders?.[provider]) {
+        resolvedProviders.delete(provider);
+      }
+    }
+  }
   for (const [provider, definition] of Object.entries(options?.pluginProviders ?? {})) {
     if (resolvedProviders.has(provider)) {
       throw new Error(`Plugin provider '${provider}' conflicts with a built-in provider`);

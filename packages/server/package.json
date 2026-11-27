@@ -14,6 +14,11 @@
   "type": "module",
   "types": "./dist/server/server/exports.d.ts",
   "exports": {
+    "./remote-workers": {
+      "types": "./dist/server/server/remote-workers/index.d.ts",
+      "source": "./src/server/remote-workers/index.ts",
+      "default": "./dist/server/server/remote-workers/index.js"
+    },
     ".": {
       "types": "./dist/server/server/exports.d.ts",
       "source": "./src/server/exports.ts",

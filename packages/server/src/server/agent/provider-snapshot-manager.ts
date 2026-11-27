@@ -130,6 +130,8 @@ export interface ProviderSnapshotManagerOptions {
   managedProcesses?: ManagedProcessRegistry;
   isDev?: boolean;
   extraClients?: Partial<Record<AgentProvider, AgentClient>>;
+  executionOnly?: boolean;
+  resolveCwd?: (cwd: string) => string;
   refreshTimeoutMs?: number;
   diagnosticTimeoutMs?: number;
   openCodeBridge?: OpenCodeBridge;
@@ -290,6 +292,8 @@ export class ProviderSnapshotManager {
   private readonly ownedClients = new Set<AgentClient>();
   private readonly pluginProviders: PluginAgentClientRegistry;
   /** Installation links and versions; separate from availability and discovery. */
+  private readonly executionOnly: boolean;
+  private readonly resolveCwd: (cwd: string) => string;
   readonly installations: ProviderInstallations;
   private pluginProvidersSettled = false;
   private readonly refreshSchedule: ProviderRefreshSchedule | null;
@@ -304,6 +308,8 @@ export class ProviderSnapshotManager {
     this.openCodeBridge = options.openCodeBridge;
     this.isDev = options.isDev === true;
     this.extraClients = options.extraClients ?? {};
+    this.executionOnly = options.executionOnly === true;
+    this.resolveCwd = options.resolveCwd ?? resolveSnapshotCwd;
     this.runtimeSettings = options.runtimeSettings;
     this.providerOverrides = options.providerOverrides;
     this.baseProviderOverrides = options.providerOverrides;
@@ -340,13 +346,12 @@ export class ProviderSnapshotManager {
   }
 
   getSnapshot(cwd?: string): ProviderSnapshot {
-    const target = resolveProviderSnapshotTarget(cwd);
+    const target = this.resolveTarget(cwd);
     return this.getSnapshotForTarget(target);
   }
 
   async refreshSnapshotForCwd(options: ProviderSnapshotRefreshOptions): Promise<void> {
-    const snapshotCwd = resolveSnapshotCwd(options.cwd);
-    const target = createWorkspaceSnapshotTarget(snapshotCwd);
+    const target = this.resolveTarget(options.cwd);
     const providers = this.resolveRefreshProviders(options.providers);
     const providersToRefresh = providers ?? this.getProviderIds();
     await this.refreshProviders(target, providersToRefresh, "manual");
@@ -357,6 +362,13 @@ export class ProviderSnapshotManager {
   ): Promise<void> {
     const providers = this.resolveRefreshProviders(options.providers);
     await this.refreshAllTargets(providers ?? this.getProviderIds(), "manual");
+  }
+
+  private resolveTarget(cwd?: string | null): ProviderSnapshotTarget {
+    const trimmed = cwd?.trim();
+    if (!trimmed) return createGlobalSnapshotTarget();
+    const path = this.resolveCwd(trimmed);
+    return { snapshotCwd: path, catalogScope: { scope: "workspace", cwd: path } };
   }
 
   private async refreshAllTargets(
@@ -382,12 +394,12 @@ export class ProviderSnapshotManager {
     await Promise.all(
       [...this.targets.keys()]
         .filter((cwd) => cwd !== homeCwd)
-        .map((cwd) => this.warmUp(createWorkspaceSnapshotTarget(cwd), providers)),
+        .map((cwd) => this.warmUp(this.resolveTarget(cwd), providers)),
     );
   }
 
   async warmUpSnapshotForCwd(options: ProviderSnapshotWarmUpOptions): Promise<void> {
-    const target = resolveProviderSnapshotTarget(options.cwd);
+    const target = this.resolveTarget(options.cwd);
     const snapshotCwd = target.snapshotCwd;
     const providers = this.resolveRefreshProviders(options.providers);
     if (options.providers && providers?.length === 0) {
@@ -469,7 +481,10 @@ export class ProviderSnapshotManager {
     registrations: readonly ProviderRegistration[],
   ): AgentManagerProviderState {
     for (const registration of registrations) {
-      if (BUILTIN_PROVIDER_IDS.includes(registration.id) || this.extraClients[registration.id]) {
+      if (
+        !this.executionOnly &&
+        (BUILTIN_PROVIDER_IDS.includes(registration.id) || this.extraClients[registration.id])
+      ) {
         throw new Error(`Plugin provider '${registration.id}' conflicts with a built-in provider`);
       }
     }
@@ -614,7 +629,7 @@ export class ProviderSnapshotManager {
   }
 
   async listProviders(input: ProviderSnapshotReadOptions = {}): Promise<ProviderSnapshotEntry[]> {
-    const target = resolveProviderSnapshotTarget(input.cwd);
+    const target = this.resolveTarget(input.cwd);
     if (input.wait) {
       await this.warmUpSnapshotForCwd({ cwd: input.cwd, providers: input.providers });
     }
@@ -827,7 +842,7 @@ export class ProviderSnapshotManager {
     if (providers.length === 0) return;
     for (const cwd of this.targets.keys()) {
       void this.warmUp(
-        resolveProviderSnapshotTarget(cwd === GLOBAL_PROVIDER_SNAPSHOT_KEY ? undefined : cwd),
+        this.resolveTarget(cwd === GLOBAL_PROVIDER_SNAPSHOT_KEY ? undefined : cwd),
         providers,
       );
     }
@@ -889,6 +904,9 @@ export class ProviderSnapshotManager {
       runtimeSettings,
       providerOverrides,
       pluginProviders: this.pluginProviders.definitions(),
+      executionProviderIds: this.executionOnly
+        ? new Set(Object.keys(this.extraClients))
+        : undefined,
       workspaceGitService: this.workspaceGitService,
       managedProcesses: this.managedProcesses,
       openCodeBridge: this.openCodeBridge,
@@ -899,9 +917,10 @@ export class ProviderSnapshotManager {
       [AgentProvider, AgentClient]
     >) {
       const definition = registry[provider];
-      if (!definition) continue;
+      if (!definition || (this.executionOnly && this.pluginProviders.has(provider))) continue;
       registry[provider] = {
         ...definition,
+        enabled: this.executionOnly || definition.enabled,
         createClient: () => client,
         resolveCreateConfig:
           client.resolveCreateConfig?.bind(client) ?? definition.resolveCreateConfig,
@@ -1180,7 +1199,7 @@ export class ProviderSnapshotManager {
               );
               const isGlobal =
                 catalogOptions.scope === "global" ||
-                boundTargets.includes(resolveProviderSnapshotTarget().snapshotCwd);
+                boundTargets.includes(this.resolveTarget().snapshotCwd);
               if (
                 background &&
                 current.result &&
@@ -1398,26 +1417,10 @@ export function resolveSnapshotCwd(cwd?: string | null): string {
   return resolved;
 }
 
-function resolveProviderSnapshotTarget(cwd?: string | null): ProviderSnapshotTarget {
-  const trimmed = cwd?.trim();
-  if (!trimmed) {
-    return createGlobalSnapshotTarget();
-  }
-  return createWorkspaceSnapshotTarget(resolveSnapshotCwd(trimmed));
-}
-
 function createGlobalSnapshotTarget(): ProviderSnapshotTarget {
   return {
     snapshotCwd: GLOBAL_PROVIDER_SNAPSHOT_KEY,
     catalogScope: { scope: "global" },
-  };
-}
-
-function createWorkspaceSnapshotTarget(cwd: string): ProviderSnapshotTarget {
-  const snapshotCwd = resolveSnapshotCwd(cwd);
-  return {
-    snapshotCwd,
-    catalogScope: { scope: "workspace", cwd: snapshotCwd },
   };
 }
 

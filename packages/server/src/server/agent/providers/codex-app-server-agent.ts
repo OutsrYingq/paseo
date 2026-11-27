@@ -328,10 +328,13 @@ interface CodexAppServerLaunchPrefix {
 }
 
 interface CodexAppServerProcessSpawnInput extends CodexAppServerLaunchPrefix {
+  agentId?: string;
   options: SpawnProcessOptions;
 }
 
-interface CodexAppServerProcessPort {
+export interface CodexAppServerProcessPort {
+  isAvailable?(): Promise<boolean>;
+  resolveOptionalFeatures?(): Promise<{ goals: boolean; autoReview: boolean }>;
   resolvePrefix(options: {
     runtimeSettings?: ProviderRuntimeSettings;
   }): Promise<CodexAppServerLaunchPrefix>;
@@ -655,7 +658,7 @@ export async function findDefaultCodexBinary(): Promise<string | null> {
   return await findCodexMicrosoftStoreBinary();
 }
 
-async function resolveCodexLaunchPrefix(
+export async function resolveCodexLaunchPrefix(
   runtimeSettings?: ProviderRuntimeSettings,
 ): Promise<CodexAppServerLaunchPrefix> {
   const launch = await resolveCodexLaunch(runtimeSettings);
@@ -8202,6 +8205,9 @@ export class CodexAppServerAgentClient implements AgentClient {
   }
 
   private resolveGoalsEnabled(): Promise<boolean> {
+    if (this.deps.appServerProcess?.resolveOptionalFeatures) {
+      return this.deps.appServerProcess.resolveOptionalFeatures().then((features) => features.goals);
+    }
     if (!this.goalsEnabledPromise) {
       this.goalsEnabledPromise = (async () => {
         try {
@@ -8227,6 +8233,9 @@ export class CodexAppServerAgentClient implements AgentClient {
   }
 
   private resolveAutoReviewEnabled(signal?: AbortSignal): Promise<boolean> {
+    if (this.deps.appServerProcess?.resolveOptionalFeatures) {
+      return this.deps.appServerProcess.resolveOptionalFeatures().then((features) => features.autoReview);
+    }
     if (signal) return this.probeAutoReviewEnabled(signal);
     if (!this.autoReviewEnabledPromise) {
       this.autoReviewEnabledPromise = this.probeAutoReviewEnabled();
@@ -8275,6 +8284,7 @@ export class CodexAppServerAgentClient implements AgentClient {
         "provider.codex.spawn",
       );
       const child = processPort.spawn({
+        agentId: options.agentId,
         command: launchPrefix.command,
         args,
         options: {
@@ -8566,6 +8576,7 @@ export class CodexAppServerAgentClient implements AgentClient {
   }
 
   async isAvailable(): Promise<boolean> {
+    if (this.deps.appServerProcess?.isAvailable) return this.deps.appServerProcess.isAvailable();
     const launch = await resolveCodexLaunch(this.runtimeSettings);
     const availability = await checkCodexLaunchAvailable(launch);
     return availability.available;

@@ -15,6 +15,7 @@ import type {
 import type { ProviderRuntimeSettings } from "../../provider-launch-config.js";
 
 export interface OmpRuntimeLaunch {
+  agentId?: string;
   cwd: string;
   argv: string[];
   env?: Record<string, string>;
@@ -29,6 +30,7 @@ export interface OmpRuntimeLaunch {
 }
 
 export interface OmpStartSessionInput {
+  agentId?: string;
   cwd: string;
   signal?: AbortSignal;
   env?: Record<string, string>;
@@ -106,6 +108,7 @@ export function buildOmpLaunch(input: {
 
   return {
     cwd: input.session.cwd,
+    agentId: input.session.agentId,
     argv,
     env:
       input.runtimeSettings?.env || input.session.env

@@ -20,7 +20,7 @@ const UntrustedWorkspaceSourceSchema = z.object({
   headRepository: z.string(),
 });
 
-const PersistedProjectRecordSchema = z.object({
+export const PersistedProjectRecordSchema = z.object({
   projectId: z.string(),
   rootPath: z.string(),
   kind: z.enum(["git", "non_git"]),
@@ -49,7 +49,7 @@ const PersistedProjectRecordSchema = z.object({
   archivedAt: z.string().nullable(),
 });
 
-const PersistedWorkspaceRecordSchema = z.object({
+export const PersistedWorkspaceRecordSchema = z.object({
   parentWorkspaceId: z.string().optional(),
   workspaceId: z.string(),
   projectId: z.string(),
@@ -195,6 +195,7 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
   private readonly cache = new Map<string, TRecord>();
   private mutationQueue: Promise<void> = Promise.resolve();
   private mutationsBlockedUntilRestart = false;
+  private readonly readRecords?: (filePath: string) => Promise<string | null>;
   private readonly writeRecords: (filePath: string, records: readonly TRecord[]) => Promise<void>;
 
   constructor(options: {
@@ -203,6 +204,7 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
     schema: z.ZodType<TRecord, unknown>;
     getId: (record: TRecord) => string;
     component: string;
+    readRecords?: (filePath: string) => Promise<string | null>;
     writeRecords?: (filePath: string, records: readonly TRecord[]) => Promise<void>;
   }) {
     this.filePath = options.filePath;
@@ -212,6 +214,7 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
       module: "workspace-registry",
       component: options.component,
     });
+    this.readRecords = options.readRecords;
     this.writeRecords = options.writeRecords ?? writeJsonFileAtomic;
   }
 
@@ -291,12 +294,15 @@ class FileBackedRegistry<TRecord extends RegistryRecord> {
 
     this.cache.clear();
     try {
-      const raw = await fs.readFile(this.filePath, "utf8");
-      const parsed = z.array(this.schema).parse(JSON.parse(raw));
+      const raw = this.readRecords
+        ? await this.readRecords(this.filePath)
+        : await fs.readFile(this.filePath, "utf8");
+      const parsed = z.array(this.schema).parse(raw === null ? [] : JSON.parse(raw));
       for (const record of parsed) {
         this.cache.set(this.getId(record), record);
       }
     } catch (error) {
+      if (this.readRecords) throw error;
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "ENOENT") {
         this.logger.error({ err: error, filePath: this.filePath }, "Failed to load registry file");
@@ -529,6 +535,7 @@ export class FileBackedWorkspaceRegistry
     filePath: string,
     logger: Logger,
     options?: {
+      readRecords?: (filePath: string) => Promise<string | null>;
       writeRecords?: (
         filePath: string,
         records: readonly PersistedWorkspaceRecord[],
@@ -541,6 +548,7 @@ export class FileBackedWorkspaceRegistry
       schema: PersistedWorkspaceRecordSchema,
       getId: (record) => record.workspaceId,
       component: "workspaces",
+      readRecords: options?.readRecords,
       writeRecords: options?.writeRecords,
     });
   }

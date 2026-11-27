@@ -2254,6 +2254,8 @@ const FORMER_ACP_PROVIDERS = new Set<string>([
 ]);
 
 function decodePersistence(handle: AgentPersistenceHandle): ProviderPersistence {
+  // The encoded ID retains fields that legacy metadata projections dropped.
+  if (handle.sessionId.startsWith("plugin:")) return decodePersistenceId(handle.sessionId);
   const fromMetadata = handle.metadata?.pluginProviderPersistence;
   if (fromMetadata !== undefined) {
     return ProviderPersistenceSchema.parse(fromMetadata);

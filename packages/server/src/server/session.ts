@@ -1,3 +1,4 @@
+import { describeProject } from "./project-descriptor.js";
 import { DiffSession } from "./diff/index.js";
 import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
 import type { AgentMessageBehavior, AgentMessageDelivery } from "./agent/agent-messages/index.js";
@@ -71,7 +72,7 @@ import {
   PluginFrameOpcode,
 } from "@getpaseo/protocol/binary-frames/index";
 import { CursorError } from "./pagination/cursor.js";
-import { SortablePager, type SortSpec } from "./pagination/sortable-pager.js";
+import { type SortSpec } from "./pagination/sortable-pager.js";
 import { matchesAgentHistoryQuery } from "./agent-history-search.js";
 import type { SpeechToTextProvider, TextToSpeechProvider } from "./speech/speech-provider.js";
 import type { TurnDetectionProvider } from "./speech/turn-detection-provider.js";
@@ -103,7 +104,7 @@ import {
 import { toWireDaemonConfig, type DaemonConfigStore } from "./daemon-config-store.js";
 import { releaseWorkspaceServicePortPlan } from "./workspace-service-port-registry.js";
 import { getErrorMessage, getErrorMessageOr } from "@getpaseo/protocol/error-utils";
-import { getAgentStatusPriority } from "@getpaseo/protocol/agent-state-bucket";
+import { createAgentDirectoryPager } from "./agent/directory-pager.js";
 import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
 import { applyRecordPatch } from "./record-patch.js";
 import type { WorkspaceGitRuntimeSnapshot, WorkspaceGitService } from "./workspace-git-service.js";
@@ -383,7 +384,6 @@ function beginAgentDeleteIfSupported(agentStorage: AgentStorage, agentId: string
   }
 }
 
-const FETCH_AGENTS_SORT_KEYS = ["status_priority", "created_at", "updated_at", "title"] as const;
 
 export function resolveWaitForFinishError(options: {
   status: "permission" | "error" | "idle";
@@ -3592,21 +3592,9 @@ export class Session {
   }
 
   private dispatchProviderMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    const catalog = this.providerCatalogSession.dispatch(msg);
+    if (catalog) return catalog;
     switch (msg.type) {
-      case "list_provider_models_request":
-        return this.providerCatalogSession.handleListProviderModelsRequest(msg);
-      case "list_provider_modes_request":
-        return this.providerCatalogSession.handleListProviderModesRequest(msg);
-      case "list_provider_features_request":
-        return this.providerCatalogSession.handleListProviderFeaturesRequest(msg);
-      case "provider.controls.list.request":
-        return this.providerCatalogSession.handleProviderControlsListRequest(msg);
-      case "list_available_providers_request":
-        return this.providerCatalogSession.handleListAvailableProvidersRequest(msg);
-      case "get_providers_snapshot_request":
-        return this.providerCatalogSession.handleGetProvidersSnapshotRequest(msg);
-      case "refresh_providers_snapshot_request":
-        return this.providerCatalogSession.handleRefreshProvidersSnapshotRequest(msg);
       case "provider_diagnostic_request":
         return this.providerCatalogSession.handleProviderDiagnosticRequest(msg);
       case "provider.installation.inspect.request":
@@ -6200,33 +6188,7 @@ export class Session {
     };
   }
 
-  private readonly agentsPager = new SortablePager<
-    AgentSnapshotPayload,
-    FetchAgentsRequestSort["key"]
-  >({
-    validKeys: FETCH_AGENTS_SORT_KEYS,
-    defaultSort: [{ key: "updated_at", direction: "desc" }],
-    label: "fetch_agents",
-    getId: (agent) => agent.id,
-    getSortValue: (agent, key): number | string => {
-      switch (key) {
-        case "status_priority":
-          return getAgentStatusPriority({
-            status: agent.status,
-            pendingPermissionCount: agent.pendingPermissions?.length ?? 0,
-            requiresAttention: agent.requiresAttention,
-            attentionReason: agent.attentionReason ?? null,
-            backgroundWork: agent.backgroundWork,
-          });
-        case "created_at":
-          return Date.parse(agent.createdAt);
-        case "updated_at":
-          return Date.parse(agent.updatedAt);
-        case "title":
-          return agent.title?.toLocaleLowerCase() ?? "";
-      }
-    },
-  });
+  private readonly agentsPager = createAgentDirectoryPager();
 
   private decodeAgentCursor(token: string, sort: SortSpec<FetchAgentsRequestSort["key"]>[]) {
     try {
@@ -6545,16 +6507,7 @@ export class Session {
     project: PersistedProjectRecord,
   ): Promise<WorkspaceProjectDescriptorPayload> {
     const icon = await this.projectIcons.snapshot(project);
-    return {
-      projectId: project.projectId,
-      ...(project.projectKey ? { projectKey: project.projectKey } : {}),
-      projectDisplayName: resolveProjectDisplayName(project),
-      projectCustomName: project.customName ?? null,
-      projectCustomIconRevision: project.customIconRevision ?? null,
-      projectIconRevision: icon.revision,
-      projectRootPath: project.rootPath,
-      projectKind: project.kind,
-    };
+    return describeProject(project, icon.revision);
   }
 
   private async withWorkspaceCheckout<T>(workspaceId: string, run: () => Promise<T>): Promise<T> {
