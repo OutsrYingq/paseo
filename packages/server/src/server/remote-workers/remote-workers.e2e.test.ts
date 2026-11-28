@@ -2,12 +2,14 @@ import { createRequire } from "node:module";
 import { X509Certificate, randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { request } from "node:http";
+import { createConnection } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import pino from "pino";
 import { afterEach, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import { DaemonClient, type WebSocketLike } from "@getpaseo/client/internal/daemon-client";
+import { acquirePidLock, getPidLockInfo, releasePidLock } from "../pid-lock.js";
 import {
   createNativeExecution,
   startRemoteCentral,
@@ -137,6 +139,59 @@ function get(port: number, host: string, route: string, password?: string) {
     );
     req.on("error", reject);
     req.end();
+  });
+}
+
+it("shares the standalone writer lock and releases it on resident shutdown", async () => {
+  const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-resident-lock-"));
+  cleanups.push(() => rm(paseoHome, { recursive: true, force: true }));
+  const binding = { workerId: "a", podUid: "pod-a", serverId: "srv_a" };
+  await writeFile(path.join(paseoHome, "server-id"), binding.serverId);
+  const tls = testTls();
+  const start = () =>
+    startResidentExecution({
+      binding,
+      paseoHome,
+      listen: { host: "127.0.0.1", port: 0 },
+      tls,
+      authorizeCentral: (fingerprint) => fingerprint === tls.fingerprint,
+      async openRuntime() {
+        throw new Error("unexpected execution connection");
+      },
+      onError: (error) => {
+        throw error;
+      },
+    }).then((resident) => {
+      cleanups.push(() => resident.close());
+      return resident;
+    });
+
+  await acquirePidLock(paseoHome, null);
+  try {
+    await expect(start()).rejects.toThrow("Another Paseo daemon is already running");
+  } finally {
+    await releasePidLock(paseoHome);
+  }
+
+  const resident = await start();
+  expect(await getPidLockInfo(paseoHome)).toMatchObject({ pid: process.pid, listen: null });
+  await expect(start()).rejects.toThrow("Another Paseo daemon is already running");
+  await expect(acquirePidLock(paseoHome, null, { ownerPid: process.pid + 1 })).rejects.toThrow(
+    "Another Paseo daemon is already running",
+  );
+  await resident.close();
+  expect(await getPidLockInfo(paseoHome)).toBeNull();
+  expect(await readFile(path.join(paseoHome, "server-id"), "utf8")).toBe(binding.serverId);
+});
+
+function probeTcp(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    socket.on("error", () => resolve(false));
+    socket.once("connect", () => {
+      socket.destroy();
+      resolve(true);
+    });
   });
 }
 
@@ -725,5 +780,11 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
   failRestart.add("b");
   await expect(b.restartServer()).rejects.toMatchObject({ code: "worker_restart_unconfirmed" });
   await expect.poll(() => restartFailures).toEqual(["b"]);
+  const fencedResident = residents.get("b")!;
+  expect(await probeTcp(fencedResident.port)).toBe(false);
+  expect(await getPidLockInfo(path.join(root, "b"))).toMatchObject({
+    pid: process.pid,
+    listen: null,
+  });
   expect((await oldRuntime.fetchAgent(agentId))?.agent.id).toBe(agentId);
 });

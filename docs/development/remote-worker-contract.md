@@ -28,6 +28,8 @@ The private execution channel binds one worker Pod and allows one active Central
 
 A prompt receipt is made durable before dispatch. A repeated completed request receives the existing result. A pending request with an unknown outcome fails without dispatching a second prompt. Central restart disconnects public clients. Clients can authenticate again, rebuild subscriptions and read history from the original volumes. Native processes and the plugin host survive ordinary execution-link loss. An explicit runtime restart resets them. A lost execution link detaches subscribers and session bridges. The resident holds an active native turn until it settles and rejects a competing resume. Plugin reload and resident shutdown can close the affected native provider. Pod replacement requires the previous volume writer to stop before the next writer mounts it.
 
+The resident acquires the same `paseo.pid` writer lock as the standalone daemon before listening. Its lock record leaves the standalone listen address empty. If a channel failure permanently fences the resident, it stops listening and retains the lock. Normal shutdown releases the lock after runtime cleanup so the next writer can reuse the same home and server ID.
+
 ## Entry points and smoke
 
 Install the server checkout's locked dependencies with `npm ci`, then run `npm run build:server-deps` and `npm run build --workspace=@getpaseo/server`. For the compatibility smoke, build `@getpaseo/client` in a separate checkout at the v0.17.4 revision above. Run that client against the 0.18.0 Central and residents in isolated local or WSL infrastructure with synthetic identity materials.

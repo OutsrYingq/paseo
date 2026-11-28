@@ -5,6 +5,12 @@ import { TLSSocket } from "node:tls";
 import type { AddressInfo } from "node:net";
 import { WebSocket, WebSocketServer } from "ws";
 import {
+  acquirePidLock,
+  PidLockError,
+  releasePidLock,
+  startPidLockHeartbeat,
+} from "../pid-lock.js";
+import {
   EXECUTION_FEATURES_HEADER,
   EXECUTION_MAX_CALLS,
   EXECUTION_MAX_FRAME,
@@ -43,8 +49,7 @@ export interface ResidentExecutionOptions {
 
 export async function startResidentExecution(options: ResidentExecutionOptions) {
   const ownBinding = WorkerBindingSchema.parse(options.binding);
-  const diskId = (await readFile(path.join(options.paseoHome, "server-id"), "utf8")).trim();
-  if (ownBinding.serverId !== diskId) throw new Error("worker_server_id_mismatch");
+  const { paseoHome } = options;
   const server = createServer(
     { ...options.tls, requestCert: true, rejectUnauthorized: true },
     (_req, res) => {
@@ -59,8 +64,17 @@ export async function startResidentExecution(options: ResidentExecutionOptions) 
   });
   const shutdown = new AbortController();
   let active: Promise<void> | undefined;
-  let fenced = false;
   let socket: WebSocket | undefined;
+  let listeningStopped: Promise<void> | undefined;
+  function stopListening() {
+    if (!listeningStopped) {
+      shutdown.abort();
+      socket?.terminate();
+      listeningStopped = new Promise<void>((resolve) => server.close(() => resolve()));
+      server.closeAllConnections();
+    }
+    return listeningStopped;
+  }
   server.on("upgrade", (request, stream, head) => {
     const peer = request.socket instanceof TLSSocket ? request.socket : undefined;
     const fingerprint = peer?.getPeerCertificate().fingerprint256;
@@ -75,7 +89,7 @@ export async function startResidentExecution(options: ResidentExecutionOptions) 
       stream.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
       return;
     }
-    if (shutdown.signal.aborted || active || fenced) {
+    if (shutdown.signal.aborted || active) {
       stream.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
       return;
     }
@@ -88,7 +102,8 @@ export async function startResidentExecution(options: ResidentExecutionOptions) 
         request.headers[EXECUTION_FEATURES_HEADER] === RUNTIME_RESTART_FEATURE,
       )
         .catch((error: unknown) => {
-          fenced = true;
+          // Stay fenced until the host stops this resident, even if no client is connected.
+          void stopListening();
           options.onError(error);
         })
         .finally(() => {
@@ -97,26 +112,46 @@ export async function startResidentExecution(options: ResidentExecutionOptions) 
         });
     });
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(options.listen, () => {
-      server.removeListener("error", reject);
-      resolve();
+  await acquirePidLock(paseoHome, null, { exclusive: true });
+  try {
+    const diskId = (await readFile(path.join(paseoHome, "server-id"), "utf8")).trim();
+    if (ownBinding.serverId !== diskId) throw new Error("worker_server_id_mismatch");
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(options.listen, () => {
+        server.removeListener("error", reject);
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    await releasePidLock(paseoHome);
+    throw error;
+  }
   server.on("error", options.onError);
-  return {
-    port: (server.address() as AddressInfo).port,
-    async close() {
-      shutdown.abort();
-      socket?.terminate();
-      const closed = new Promise<void>((resolve) => server.close(() => resolve()));
-      server.closeAllConnections();
+  const stopLockHeartbeat = startPidLockHeartbeat(paseoHome, {
+    keepAlive: true,
+    async onError(error) {
+      options.onError(error);
+      if (!(error instanceof PidLockError)) return;
+      try {
+        await close();
+      } catch (cleanupError) {
+        options.onError(cleanupError);
+      }
+    },
+  });
+  let closing: Promise<void> | undefined;
+  function close() {
+    return (closing ??= (async () => {
+      const stopped = stopListening();
       await active;
       await options.shutdownRuntime?.();
-      await closed;
-    },
-  };
+      await stopped;
+      stopLockHeartbeat();
+      await releasePidLock(paseoHome);
+    })());
+  }
+  return { port: (server.address() as AddressInfo).port, close };
 }
 
 async function handleChannel(
