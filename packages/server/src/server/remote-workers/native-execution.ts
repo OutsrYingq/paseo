@@ -61,6 +61,8 @@ import { loadPersistedConfig } from "../persisted-config.js";
 import { resolveSpeechConfig } from "../speech/speech-config-resolver.js";
 import { createSpeechService, type SpeechService } from "../speech/speech-runtime.js";
 import { openResidentDictation } from "./resident-dictation.js";
+import { openResidentVoice } from "./resident-voice.js";
+import { createResidentPush } from "./remote-push.js";
 
 interface OwnedProcess {
   child: ChildProcessWithoutNullStreams;
@@ -85,6 +87,7 @@ function stopProcess(process: OwnedProcess): Promise<void> {
 export interface NativeExecutionOptions {
   paseoHome: string;
   worktreesRoot?: string;
+  pushDeliver?: Parameters<typeof createResidentPush>[0]["deliver"];
   workspaceRoots?: readonly string[];
   plugins?: {
     daemonVersion: string;
@@ -104,11 +107,12 @@ export function createNativeExecution(options: NativeExecutionOptions) {
     listNativeProviders,
   });
   let hostSettings = makeHostSettings();
+  let push: ReturnType<typeof createResidentPush> | undefined;
   let speech: SpeechService | undefined;
   function readSpeechConfig() {
     const resolved = resolveSpeechConfig({
       paseoHome: options.paseoHome,
-      env: { ...process.env, PASEO_VOICE_MODE_ENABLED: "false" },
+      env: process.env,
       persisted: loadPersistedConfig(options.paseoHome, logger),
     });
     return { openaiConfig: resolved.openai, speechConfig: resolved.speech };
@@ -179,6 +183,7 @@ export function createNativeExecution(options: NativeExecutionOptions) {
     );
     const owner = Symbol("worker link");
     const dictation = openResidentDictation(getSpeech, publish, logger);
+    const voice = openResidentVoice(getSpeech, publish, logger, signal);
     const setupRuntime = new WorkspaceSetupRuntime();
     const runningSetup = new Set<string>();
     const stopSetup = () => Promise.all([...runningSetup].map((id) => setupRuntime.stop(id)));
@@ -477,6 +482,8 @@ export function createNativeExecution(options: NativeExecutionOptions) {
     return Promise.resolve({
       workspaceOperations: true,
       dictation: true,
+      voice: true,
+      push: true,
       async execute(operation) {
         signal.throwIfAborted();
         if ("processId" in operation) return executeProcess(operation);
@@ -497,6 +504,16 @@ export function createNativeExecution(options: NativeExecutionOptions) {
           case "dictationInput":
           case "dictationClose":
             return dictation.execute(operation);
+          case "voiceReadiness":
+          case "voiceInput":
+          case "voiceClose":
+          case "voiceAgentResult":
+            return voice.execute(operation);
+          case "pushTokenRenew":
+          case "pushTokenRevoke":
+          case "pushNotificationSend":
+            push ??= createResidentPush({ paseoHome: options.paseoHome, logger, deliver: options.pushDeliver });
+            return push(operation);
           case "workspaceRefs": {
             return (await listWorkspaces())
               .filter((workspace) => !workspace.archivedAt)
@@ -648,6 +665,7 @@ export function createNativeExecution(options: NativeExecutionOptions) {
       },
       async restartRuntime(keepTerminals) {
         dictation.close();
+        await voice.close();
         await speech?.stop();
         speech = undefined;
         terminalChannel.dispose();
@@ -659,6 +677,7 @@ export function createNativeExecution(options: NativeExecutionOptions) {
       },
       async close() {
         dictation.close();
+        await voice.close();
         terminalChannel.dispose();
         scriptChannel.close();
         await plugins?.close();

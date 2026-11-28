@@ -19,7 +19,7 @@ export function createRemotePluginSession(options: {
   const refs = new Map<string, RemotePluginRef>();
   const subscriptions = new Map<string, () => void>();
   const stop = client.subscribe((event) => {
-    if (signal.aborted || event.type === "providersChanged") return;
+    if (signal.aborted || event.type === "providersChanged" || event.type === "pluginNotification") return;
     refs.set(event.plugin.id, event.plugin);
     if (event.type === "catalogChanged") {
       send({

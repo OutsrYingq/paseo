@@ -3,6 +3,7 @@ import {
   PluginIdSchema,
   PluginListItemSchema,
   PluginLogEntrySchema,
+  PluginNotificationOpenTargetSchema,
   PluginRegistryGetRequestSchema,
   PluginRegistryGetResponseSchema,
   PluginRegistryListResponseSchema,
@@ -218,6 +219,17 @@ export const RemotePluginEventSchema = z.strictObject({
     z.strictObject({ type: z.literal("catalogChanged"), plugin }),
     z.strictObject({ type: z.literal("settingsChanged"), plugin, settingsId: name }),
     z.strictObject({ type: z.literal("providersChanged") }),
+    z.strictObject({
+      type: z.literal("pluginNotification"),
+      notification: z.strictObject({
+        pluginId: PluginIdSchema,
+        notificationId: id,
+        title: z.string(),
+        body: z.string(),
+        open: PluginNotificationOpenTargetSchema.optional(),
+        data: z.record(z.string(), z.json()).optional(),
+      }),
+    }),
     z.strictObject({ type: z.literal("usageReport"), queryId: id, report: UsageReportEntrySchema }),
     z.strictObject({ type: z.literal("subscriptionEvent"), subscriptionId: id, value: rpcPayload }),
     z.strictObject({

@@ -40,7 +40,7 @@ import {
   isStoredAgentProviderAvailable,
   toAgentPersistenceHandle,
 } from "../persistence-hooks.js";
-import { WorkerOperationError } from "./execution-protocol.js";
+import { WorkerOperationError, type WorkerEvent } from "./execution-protocol.js";
 import type { createRemoteState } from "./remote-state.js";
 import type { createRemoteFileTransfer } from "./remote-file-transfer.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "../agent/agent-loading.js";
@@ -53,6 +53,8 @@ import {
   projectProviderSubagentUpdate,
   readBackgroundWorkUpdate,
 } from "../session/agent-history/agent-orchestration.js";
+import { wrapSpokenInput } from "../voice-config.js";
+import { PASEO_MCP_SERVER_NAME } from "../agent/runtime-mcp-config.js";
 
 export type CentralTimelineUpdate = Extract<
   SessionOutboundMessage,
@@ -89,11 +91,14 @@ export async function openCentralAgents(
     resolveCwd: (cwd) => cwd,
     backgroundRefresh: { intervalMs: PROVIDER_BACKGROUND_REFRESH_INTERVAL_MS },
   });
+  type VoiceRuntime = NonNullable<ReturnType<NonNullable<AgentManagerOptions["resolveVoiceRuntime"]>>>;
+  const voiceRuntime = new Map<string, VoiceRuntime>();
   const manager = new AgentManager({
     ...options.manager,
     logger,
     clients,
     registry: storage,
+    resolveVoiceRuntime: (agentId) => voiceRuntime.get(agentId),
   });
   const dependencies = { logger, agentManager: manager, agentStorage: storage };
   const agentMessages = createManagerMessageDelivery({ ...dependencies, signal });
@@ -504,6 +509,60 @@ export async function openCentralAgents(
     },
     cancelAgent: (id: string) => cancelAgentRunCommand(dependencies, id),
     archiveAgent: (id: string) => archiveAgentCommand(dependencies, id),
+    async executeVoiceAction(
+      agentId: string,
+      action: Extract<WorkerEvent, { type: "voiceAgentAction" }>["action"],
+      request: AbortSignal | undefined,
+    ) {
+      requireActive(request);
+      const record = await storage.get(agentId);
+      requireActive(request);
+      if (record?.internal || record?.archivedAt || manager.getAgent(agentId)?.internal) {
+        throw new WorkerOperationError("agent_not_found");
+      }
+      switch (action.kind) {
+        case "load": {
+          const agent = await ensureUnarchivedAgentLoaded(agentId, dependencies);
+          if (agent.config.mcpServers?.[PASEO_MCP_SERVER_NAME]) {
+            throw new WorkerOperationError("The agent already has a custom paseo MCP server");
+          }
+          return agent.config.systemPrompt ?? null;
+        }
+        case "reload": {
+          if (action.restore) {
+            if (!voiceRuntime.delete(agentId)) return agentId;
+            if (!manager.getAgent(agentId)) return agentId;
+            return (await manager.reloadAgentSession(agentId)).id;
+          }
+          if (!action.speakMcp || action.systemPrompt === null) {
+            throw new WorkerOperationError("worker_voice_mcp_unavailable");
+          }
+          voiceRuntime.set(agentId, {
+            systemPrompt: action.systemPrompt,
+            mcpBaseUrl: action.speakMcp.url,
+            mcpAuthToken: action.speakMcp.token,
+          });
+          try {
+            return (await manager.reloadAgentSession(agentId)).id;
+          } catch (error) {
+            voiceRuntime.delete(agentId);
+            throw error;
+          }
+        }
+        case "submit":
+          await sendPrompt(agentId, { text: wrapSpokenInput(action.text) }, request);
+          return null;
+        case "interrupt":
+          if (manager.hasInFlightRun(agentId)) await cancelAgentRunCommand(dependencies, agentId);
+          return null;
+        case "hasActiveRun":
+          return manager.hasInFlightRun(agentId);
+      }
+    },
+    async releaseVoiceRuntime(agentId: string) {
+      if (!voiceRuntime.delete(agentId) || signal.aborted || !manager.getAgent(agentId)) return;
+      await manager.reloadAgentSession(agentId);
+    },
     async clearAgentAttention(ids: string[]) {
       requireActive();
       for (const id of ids) {

@@ -23,6 +23,7 @@ import type { AgentUsageSession } from "../agent/agent-sdk-types.js";
 import { DaemonConfigStore } from "../daemon-config-store.js";
 import { loadPersistedConfig } from "../persisted-config.js";
 import { PluginService } from "../plugins/index.js";
+import type { ValidatedPluginNotification } from "../plugins/notifications.js";
 import { ManagedPluginSources } from "../plugins/managed-source.js";
 import { BuiltinPluginLoader, builtinPlugins } from "../plugins/builtin/index.js";
 import type { AgentUsageLookup } from "../plugins/usage-sources/index.js";
@@ -144,6 +145,7 @@ export function createResidentPluginHost(options: ResidentPluginHostOptions) {
         attach(id: string, pluginId: string): void;
         forward(id: string, data: string | Uint8Array): void;
         notifySettings(id: string, settingsId: string): void;
+        notifyPlugin(notification: ValidatedPluginNotification): void;
         close(): Promise<void>;
       }
     | undefined;
@@ -170,6 +172,9 @@ export function createResidentPluginHost(options: ResidentPluginHostOptions) {
   }
 
   service.bindPaseoSessionHost({
+    sendPluginNotification(notification) {
+      channel?.notifyPlugin(notification);
+    },
     async attachPluginSocket(pluginId, socket) {
       if (closing) throw new Error("worker_plugins_closed");
       const id = randomUUID();
@@ -585,6 +590,9 @@ export function createResidentPluginHost(options: ResidentPluginHostOptions) {
       },
       notifySettings(id: string, settingsId: string) {
         publish({ type: "settingsChanged", plugin: pluginRef(id), settingsId });
+      },
+      notifyPlugin(notification: ValidatedPluginNotification) {
+        publish({ type: "pluginNotification", notification });
       },
       close: closeChannel,
     };

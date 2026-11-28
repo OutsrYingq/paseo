@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { DICTATION_HEADER, DICTATION_VERSION } from "./remote-dictation-protocol.js";
+import { VOICE_HEADER, VOICE_VERSION, VOICE_OPERATION_KINDS } from "./remote-voice-protocol.js";
 import { Agent as HttpsAgent } from "node:https";
 import { checkServerIdentity, type ConnectionOptions, type PeerCertificate } from "node:tls";
 import { WebSocket } from "ws";
@@ -11,6 +12,9 @@ import {
   EXECUTION_PROTOCOL,
   RUNTIME_RESTART_FEATURE,
   WORKSPACE_OPERATIONS_HEADER,
+  PUSH_HEADER,
+  PUSH_VERSION,
+  PUSH_OPERATION_KINDS,
   WORKSPACE_OPERATIONS_VERSION,
   WORKSPACE_OPERATION_KINDS,
   ExecutionResponseSchema,
@@ -52,6 +56,16 @@ export class WorkerConnection {
   private runtimeRestart = false;
   private workspaceOperations = false;
   private dictation = false;
+  private voice = false;
+  private push = false;
+
+  get supportsVoice() {
+    return this.voice;
+  }
+
+  get supportsPush() {
+    return this.push;
+  }
 
   get supportsDictation() {
     return this.dictation;
@@ -93,6 +107,8 @@ export class WorkerConnection {
         [EXECUTION_FEATURES_HEADER]: RUNTIME_RESTART_FEATURE,
         [WORKSPACE_OPERATIONS_HEADER]: WORKSPACE_OPERATIONS_VERSION,
         [DICTATION_HEADER]: DICTATION_VERSION,
+        [VOICE_HEADER]: VOICE_VERSION,
+        [PUSH_HEADER]: PUSH_VERSION,
       },
       followRedirects: false,
       handshakeTimeout: 5_000,
@@ -128,6 +144,8 @@ export class WorkerConnection {
           this.runtimeRestart = message.restartRuntime === true;
           this.workspaceOperations = message.workspaceOperations === true;
           this.dictation = message.dictation === true;
+          this.voice = message.voice === true;
+          this.push = message.push === true;
           bound = true;
           clearTimeout(timer);
           resolve();
@@ -163,6 +181,12 @@ export class WorkerConnection {
   ): Promise<WorkerResult<K>> {
     await this.ready();
     const request: WorkerOperation = operation;
+    if (VOICE_OPERATION_KINDS.has(operation.kind) && !this.voice) {
+      throw new WorkerOperationError("worker_voice_unsupported");
+    }
+    if (PUSH_OPERATION_KINDS.has(operation.kind) && !this.push) {
+      throw new WorkerOperationError("worker_push_unsupported");
+    }
     if (WORKSPACE_OPERATION_KINDS.has(operation.kind) && !this.workspaceOperations) {
       throw new WorkerOperationError("worker_workspace_operations_unsupported");
     }

@@ -73,6 +73,9 @@ import {
   isWorkspaceLabelRequest,
 } from "../session/workspace-labels/label-session.js";
 import type { RemoteDictationEvent } from "./remote-dictation-protocol.js";
+import { createCentralVoice, isVoiceInput } from "./central-voice.js";
+import { createCentralNotifications, resolveCentralTerminalAttention } from "./central-notifications.js";
+import { findLatestPermissionRequest } from "@getpaseo/protocol/agent-attention-notification";
 type HostSettingsEvent = Extract<SessionOutboundMessage, { type: "status" }>;
 
 export interface CentralOptions {
@@ -96,6 +99,8 @@ type WorkerScope = Awaited<ReturnType<typeof openCentralAgents>> & {
   setupObservation: WorkspaceSetupObservation;
   history: ReturnType<Awaited<ReturnType<typeof openCentralAgents>>["createHistorySession"]>;
   hostSettings: ReturnType<typeof createCentralHostSettings>;
+  voice: ReturnType<typeof createCentralVoice>;
+  notifications: ReturnType<typeof createCentralNotifications>;
 };
 const connectionLostEvent = Symbol("connection lost");
 type TimelineSubscriptions = Map<string, ReadonlySet<string>>;
@@ -103,7 +108,8 @@ type TimelineSubscriptions = Map<string, ReadonlySet<string>>;
 type ScriptStatusEvent = Extract<WorkerEvent, { type: "scriptStatus" }>;
 type Delivery = (
   event: CentralTimelineUpdate | CentralOrchestrationEvent | ScriptStatusEvent |
-    HostSettingsEvent | RemoteDictationEvent | typeof connectionLostEvent,
+    HostSettingsEvent | RemoteDictationEvent | Extract<WorkerEvent, { type: "voiceReadiness" }> |
+    typeof connectionLostEvent,
 ) => void;
 
 export async function startRemoteCentral(options: CentralOptions) {
@@ -160,6 +166,7 @@ export async function startRemoteCentral(options: CentralOptions) {
     const diffSubscriptions = createRemoteDiffSubscriptions(connection);
     const scripts = createRemoteScripts(connection);
     const setupObservation = new WorkspaceSetupObservation();
+    const voice = createCentralVoice(connection, options.logger);
     connection.setEventHandler((event) => {
       if ("processId" in event) providers.onEvent(event);
       else if (event.type === "plugin") plugins.onEvent(event);
@@ -167,7 +174,13 @@ export async function startRemoteCentral(options: CentralOptions) {
       else if (event.type === "diffFrame" || event.type === "legacyDiffSnapshot") {
         diffSubscriptions.deliver(event);
       }
-      else if (event.type === "scriptStatus" || event.type === "dictationReadiness" || event.type === "dictationOutput") {
+      else if (event.type === "voiceAgentAction" || event.type === "voiceOutput") {
+        voice.deliver(event);
+      }
+      else if (
+        event.type === "scriptStatus" || event.type === "dictationReadiness" ||
+        event.type === "dictationOutput" || event.type === "voiceReadiness"
+      ) {
         for (const deliver of audiences.get(execution) ?? []) deliver(event);
       }
       else if (event.type === "worktreeSetup") {
@@ -184,6 +197,23 @@ export async function startRemoteCentral(options: CentralOptions) {
     terminals = createRemoteTerminalManager(connection, (error) =>
       logger.warn({ err: error }, "Remote terminal operation failed"),
     );
+    const notifications = createCentralNotifications({
+      serverId: execution.target.serverId,
+      logger,
+      call: (operation) =>
+        connection.supportsPush ? connection.call(operation) : Promise.resolve(null),
+    });
+    const stopTerminalAttention = terminals.subscribeTerminalActivity((event) => {
+      if (connection.signal.aborted) return;
+      const reason = resolveCentralTerminalAttention(event);
+      if (reason) notifications.terminal({
+        terminalId: event.terminalId,
+        cwd: event.cwd,
+        workspaceId: event.workspaceId,
+        terminalName: event.name,
+        reason,
+      });
+    });
     const state = createRemoteState(connection);
     const opened = openCentralAgents(
       {
@@ -254,10 +284,24 @@ export async function startRemoteCentral(options: CentralOptions) {
     }
     const stopPlugins = plugins.subscribe((event) => {
       if (event.type === "providersChanged") void refreshPlugins();
+      else if (event.type === "pluginNotification") notifications.plugin(event.notification);
     });
     const scope = opened.then(async (value) => {
       await Promise.all([terminals.initialize(), refreshPlugins()]);
       const workerDirectory = await directory;
+      value.manager.setAgentAttentionCallback((event) => {
+        const agent = value.manager.getAgent(event.agentId);
+        if (!agent?.workspaceId || agent.internal || agent.background) return;
+        const workspaceId = agent.workspaceId;
+        void value.manager.getLastAssistantMessage(event.agentId).then((assistantMessage) => {
+          if (!connection.signal.aborted) notifications.agent({
+            ...event,
+            workspaceId,
+            assistantMessage,
+            permissionRequest: findLatestPermissionRequest(agent.pendingPermissions),
+          });
+        }).catch((err) => logger.warn({ err, agentId: event.agentId }, "Failed to publish agent attention"));
+      });
       return Object.assign(value, {
         connection,
         terminals,
@@ -279,11 +323,14 @@ export async function startRemoteCentral(options: CentralOptions) {
           },
         }),
         plugins,
+        voice,
+        notifications,
         directory: workerDirectory,
       });
     });
     scopeByTarget.set(execution, scope);
     const invalidate = () => {
+      stopTerminalAttention();
       stopPlugins();
       void pluginProviders.shutdown().catch(() => undefined);
       terminals.dispose();
@@ -466,6 +513,14 @@ export async function startRemoteCentral(options: CentralOptions) {
       let dictationReadiness: { enabled: boolean; reason: string } | undefined;
       let serverInfoSent = false;
       const socketLifetime = new AbortController();
+      const voiceEnabled =
+        scope.connection.supportsVoice && authorization.allowsPermission("workspace.write");
+      let voiceReadiness: { enabled: boolean; reason: string } | undefined;
+      const voice = scope.voice.attach(
+        scope,
+        AbortSignal.any([socketLifetime.signal, lease.signal]),
+        sendAuthorized,
+      );
       let focusedAgentId: string | null = null;
       const sendBinary = (bytes: Uint8Array): Promise<void> => {
         if (lease.signal.aborted || socket.readyState !== WebSocket.OPEN) {
@@ -551,6 +606,35 @@ export async function startRemoteCentral(options: CentralOptions) {
       };
       const subscriptions: TimelineSubscriptions = new Map();
       const eventSubscriptions = new Map<string, Set<string>>();
+      const notificationSubscriptions = new Set<string>();
+      const notificationSession = scope.notifications.attach({
+        authorization,
+        wantsEvent(event) {
+          for (const events of eventSubscriptions.values()) if (events.has(event)) return true;
+          return false;
+        },
+        wantsNotification(event) {
+          for (const id of notificationSubscriptions) {
+            if (eventSubscriptions.get(id)?.has(event)) return true;
+          }
+          return false;
+        },
+        emit(event) {
+          if (event.type === "push.unregister.response") return sendAuthorized(event);
+          let shouldNotify = event.payload.shouldNotify;
+          for (const [subscriptionId, events] of eventSubscriptions) {
+            if (!events.has(event.type)) continue;
+            const notify = shouldNotify && notificationSubscriptions.has(subscriptionId);
+            if (event.type === "agent_attention_required")
+              sendAuthorized({ ...event, payload: { ...event.payload, shouldNotify: notify, subscriptionId } });
+            else if (event.type === "terminal_attention_required")
+              sendAuthorized({ ...event, payload: { ...event.payload, shouldNotify: notify, subscriptionId } });
+            else sendAuthorized({ ...event, payload: { ...event.payload, shouldNotify: notify, subscriptionId } });
+            if (notify) shouldNotify = false;
+          }
+        },
+        clearTerminalAttention: (id) => scope.terminals.clearTerminalAttention(id),
+      });
       const creationSubscriptions = new Map<string, () => void>();
       let sessionClosed = false;
       const labelsDelivery = new SessionDelivery((_source, update) => sendAuthorized(update));
@@ -679,6 +763,13 @@ export async function startRemoteCentral(options: CentralOptions) {
       }
       const deliver: Delivery = (event) => {
         if (event === connectionLostEvent) return socket.close(1013, "Worker connection lost");
+        if (event.type === "voiceReadiness") {
+          if (voiceEnabled && !lease.signal.aborted) {
+            voiceReadiness = event.state;
+            if (serverInfoSent) sendServerInfo();
+          }
+          return;
+        }
         if (lease.signal.aborted) return;
         if (event.type === "dictationReadiness") {
           if (dictationEnabled) {
@@ -774,6 +865,8 @@ export async function startRemoteCentral(options: CentralOptions) {
           options.logger.warn({ err: error }, "Worker subscription cleanup failed"),
         );
         pluginSession.close();
+        notificationSession.close();
+        void voice.close().catch((err) => options.logger.warn({ err }, "Failed to close voice source"));
         lease.signal.removeEventListener("abort", detached);
         if (dictationSource && !scope.connection.signal.aborted) {
           void scope.connection.call({ kind: "dictationClose", source: dictationSource }).catch((err) => {
@@ -926,6 +1019,7 @@ export async function startRemoteCentral(options: CentralOptions) {
           }
           return;
         }
+        if (isVoiceInput(operation)) return voice.dispatch(operation);
         if (operation.type === "file.upload.request") return transfers.beginUpload(operation);
         if (operation.type === "file_explorer_request" && scope.connection.supportsWorkspaceOperations) {
           return transfers.explore(operation);
@@ -937,6 +1031,7 @@ export async function startRemoteCentral(options: CentralOptions) {
         if (operation.type === "subscription.release.request") {
           subscriptions.delete(operation.subscriptionId);
           eventSubscriptions.delete(operation.subscriptionId);
+          notificationSubscriptions.delete(operation.subscriptionId);
           directory.release(operation.subscriptionId);
           await labelsDelivery.request(socket, operation, () => labelsDelivery.release(operation.subscriptionId));
           creationSubscriptions.get(operation.subscriptionId)?.();
@@ -956,6 +1051,7 @@ export async function startRemoteCentral(options: CentralOptions) {
             throw new WorkerOperationError("worker_subscription_limit");
           const subscriptionId = randomUUID();
           eventSubscriptions.set(subscriptionId, new Set(operation.events));
+          if (operation.notifications) notificationSubscriptions.add(subscriptionId);
           sendAuthorized({
             type: "session.events.set_subscription.response",
             payload: { requestId: operation.requestId, subscriptionId },
@@ -1026,7 +1122,11 @@ export async function startRemoteCentral(options: CentralOptions) {
         }
         if (operation.type === "client_heartbeat") {
           focusedAgentId = operation.focusedAgentId;
-          return;
+          return notificationSession.handle(operation);
+        }
+        if (operation.type === "register_push_token" || operation.type === "push.unregister.request") {
+          if (!scope.connection.supportsPush) throw new WorkerOperationError("worker_push_unsupported");
+          return notificationSession.handle(operation);
         }
         const checkout = scope.checkout(operation, focusedAgentId, lease.signal);
         if (checkout) {
@@ -1183,22 +1283,25 @@ export async function startRemoteCentral(options: CentralOptions) {
         },
       };
       function sendServerInfo() {
-        const capabilities = dictationReadiness && {
+        const unavailable = { enabled: false, reason: "Voice feature unavailable" };
+        const capabilities = (dictationReadiness || voiceReadiness) && {
           voice: {
-            dictation: dictationReadiness,
-            voice: { enabled: false, reason: "Voice mode unavailable" },
+            dictation: dictationReadiness ?? unavailable,
+            voice: voiceReadiness ?? unavailable,
           },
         };
         sendSession({ ...serverInfo, payload: { ...serverInfo.payload, capabilities } });
       }
-      if (dictationEnabled) {
-        try {
-          const state = await scope.connection.call({ kind: "dictationReadiness" });
-          dictationReadiness ??= state;
-        } catch (err) {
-          options.logger.warn({ err }, "Worker dictation readiness unavailable");
-        }
-      }
+      await Promise.all([
+        dictationEnabled && scope.connection.call({ kind: "dictationReadiness" }).then(
+          (state) => { dictationReadiness ??= state; },
+          (err) => options.logger.warn({ err }, "Worker dictation readiness unavailable"),
+        ),
+        voiceEnabled && scope.connection.call({ kind: "voiceReadiness" }).then(
+          (state) => { voiceReadiness ??= state; },
+          (err) => options.logger.warn({ err }, "Worker voice readiness unavailable"),
+        ),
+      ]);
       if (!socketLifetime.signal.aborted) {
         sendServerInfo();
         serverInfoSent = true;

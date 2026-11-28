@@ -56,6 +56,13 @@ import {
   remoteDictationResults,
 } from "./remote-dictation-protocol.js";
 
+import { RemoteVoiceEvents, RemoteVoiceOperations, remoteVoiceResults } from "./remote-voice-protocol.js";
+import { RemotePushOperationSchema, remotePushResults } from "./remote-push.js";
+
+export const PUSH_HEADER = "x-paseo-push";
+export const PUSH_VERSION = "1";
+export const PUSH_OPERATION_KINDS = new Set<string>(Object.keys(remotePushResults));
+
 export const EXECUTION_PROTOCOL = "paseo.worker.v1";
 export const EXECUTION_PATH = "/execute";
 export const EXECUTION_FEATURES_HEADER = "x-paseo-execution-features";
@@ -108,6 +115,8 @@ export const WorkerOperationSchema = z.discriminatedUnion("kind", [
   ...RemoteProjectGithubOperationSchema.options,
   ...RemoteProjectIconOperationSchema.options,
   ...RemoteDictationOperations,
+  ...RemoteVoiceOperations,
+  ...RemotePushOperationSchema.options,
   z.strictObject({
     kind: z.literal("explore"),
     ...fileTarget,
@@ -192,6 +201,7 @@ const WorkerEventSchema = z.discriminatedUnion("type", [
   RemoteScriptEventSchema,
   RemoteWorktreeSetupEventSchema,
   ...RemoteDictationEvents,
+  ...RemoteVoiceEvents,
   z.strictObject({ type: z.literal("fileVersion"), id: z.uuid(), version: FileVersionSchema }),
   z.strictObject({
     type: z.literal("output"),
@@ -214,6 +224,8 @@ export const ExecutionResponseSchema = z.discriminatedUnion("kind", [
     restartRuntime: z.literal(true).optional(),
     workspaceOperations: z.literal(true).optional(),
     dictation: z.literal(true).optional(),
+    voice: z.literal(true).optional(),
+    push: z.literal(true).optional(),
   }),
   z.strictObject({
     kind: z.literal("result"),
@@ -264,6 +276,8 @@ export const operationResults = {
   ...remoteProjectGithubResults,
   ...remoteProjectIconResults,
   ...remoteDictationResults,
+  ...remoteVoiceResults,
+  ...remotePushResults,
   ...remoteTerminalOperationResults,
   plugin: RemotePluginResultSchema,
   restartRuntime: z.null(),

@@ -40,7 +40,7 @@ export interface RemotePluginClientOptions {
 
 type Notification = Extract<
   RemotePluginEvent["event"],
-  { type: "catalogChanged" | "settingsChanged" | "providersChanged" }
+  { type: "catalogChanged" | "settingsChanged" | "providersChanged" | "pluginNotification" }
 >;
 
 export class RemotePluginHandlerError extends Error {}
@@ -207,6 +207,7 @@ export class RemotePluginClient {
       case "catalogChanged":
       case "settingsChanged":
       case "providersChanged":
+      case "pluginNotification":
         for (const listener of this.listeners) listener(event);
         break;
       case "usageReport":

@@ -255,6 +255,10 @@ it("imports and rewinds an OMP history through the public SDK", async () => {
   const transcriber = createServer((req, res) => {
     req.resume();
     req.on("end", () => {
+      if (req.method !== "POST" || req.url !== "/v1/audio/transcriptions") {
+        res.writeHead(404).end();
+        return;
+      }
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ text: "Resident transcript" }));
     });
@@ -263,6 +267,7 @@ it("imports and rewinds an OMP history through the public SDK", async () => {
   cleanups.push(() => new Promise<void>((resolve) => transcriber.close(() => resolve())));
   const speechAddress = transcriber.address();
   if (!speechAddress || typeof speechAddress === "string") throw new Error("Missing speech fixture address");
+  const pushes: Array<{ host: string; tokens: string[]; agentId: unknown }> = [];
   const timestamp = new Date().toISOString();
   const workspaceId = "same-workspace";
   const projectId = "same-project";
@@ -300,6 +305,9 @@ it("imports and rewinds an OMP history through the public SDK", async () => {
       paseoHome: local,
       workspaceRoots: [local],
       logger,
+      async pushDeliver(tokens, payload) {
+        pushes.push({ host: label, tokens, agentId: payload.data?.agentId });
+      },
       providers: {
         omp: {
           command: { mode: "replace", argv: [process.execPath, script, "omp"] },
@@ -552,6 +560,25 @@ it("imports and rewinds an OMP history through the public SDK", async () => {
     .toEqual([{ name: "Reviewed", color: "blue" }]);
   expect(await other.listWorkspaceLabels()).toMatchObject({ labels: [] });
   await labels.release();
+
+  const ownerToken = "ExponentPushToken[fixture-owner]";
+  const otherToken = "ExponentPushToken[fixture-other]";
+  client.registerPushToken(ownerToken);
+  other.registerPushToken(otherToken);
+  await expect.poll(async () => {
+    try {
+      return await readFile(path.join(cwd, "push-tokens.json"), "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+      throw error;
+    }
+  }).toContain(ownerToken);
+  await client.sendAgentMessage(imported.id, "notify on finish", { messageId: "push-fixture" });
+  await expect.poll(() => pushes).toEqual([
+    { host: "owner", tokens: [ownerToken], agentId: imported.id },
+  ]);
+  await client.unregisterPushToken(ownerToken);
+  expect(await readFile(path.join(cwd, "push-tokens.json"), "utf8")).not.toContain(ownerToken);
 }, 30_000);
 
 it("uses the unchanged SDK against two mTLS residents and isolated native and download paths", async () => {
