@@ -30,6 +30,7 @@ import {
 import { createWorktree, deletePaseoWorktree } from "../../../utils/worktree.js";
 import { expandTilde } from "../../../utils/path.js";
 import type { GitMetadataGenerator } from "./git-metadata-generator.js";
+import { openResidentCheckoutQueries } from "../../remote-workers/resident-checkout.js";
 
 function isCheckDetailsResponse(msg: SessionOutboundMessage): boolean {
   return msg.type === "checkout.forge.get_check_details.response";
@@ -1724,6 +1725,92 @@ describe("CheckoutSession", () => {
       ]);
     });
   });
+});
+
+it("executes resident checkout actions and refuses cross-root merge and push targets", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "resident-checkout-actions-")));
+  const repo = join(root, "repo");
+  const base = join(root, "base");
+  const remote = join(root, "remote.git");
+  const checkout = openResidentCheckoutQueries({
+    roots: [repo],
+    paseoHome: join(root, "home"),
+    logger: pino({ level: "silent" }),
+    signal: new AbortController().signal,
+    publish: () => {},
+  });
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", args, { cwd, encoding: "utf8", stdio: "pipe" }).trim();
+  const action = { cwd: repo, requestId: "resident" };
+  try {
+    git(root, "init", "-b", "main", repo);
+    git(repo, "config", "user.name", "Checkout Test");
+    git(repo, "config", "user.email", "test@example.com");
+    writeFileSync(join(repo, "file.txt"), "base\n");
+    git(repo, "add", "file.txt");
+    git(repo, "commit", "-m", "base");
+    const baseSha = git(repo, "rev-parse", "HEAD");
+    git(repo, "branch", "feature");
+    git(repo, "switch", "--detach");
+    git(repo, "worktree", "add", base, "main");
+    git(root, "init", "--bare", remote);
+    git(repo, "remote", "add", "origin", remote);
+
+    const switched = await checkout.action({
+      ...action,
+      type: "checkout_switch_branch_request",
+      branch: "feature",
+    });
+    expect(switched).toMatchObject({
+      response: { payload: { success: true, source: "local" } },
+      workspaceUpdate: true,
+    });
+    expect(git(repo, "branch", "--show-current")).toBe("feature");
+
+    const renamed = await checkout.action({
+      ...action,
+      type: "checkout.rename_branch.request",
+      branch: "renamed",
+    });
+    expect(renamed).toMatchObject({
+      response: { payload: { success: true, currentBranch: "renamed" } },
+      workspaceUpdate: true,
+      branchSnapshot: { branchName: "renamed" },
+    });
+    writeFileSync(join(repo, "file.txt"), "feature\n");
+    expect((await checkout.action({ ...action, type: "stash_save_request" })).response)
+      .toMatchObject({ payload: { success: true } });
+    expect(git(repo, "status", "--porcelain")).toBe("");
+    expect((await checkout.action({ ...action, type: "stash_pop_request", stashIndex: 0 })).response)
+      .toMatchObject({ payload: { success: true } });
+    expect((await checkout.action({
+      ...action, type: "checkout_commit_request", message: "feature",
+    })).response).toMatchObject({ payload: { success: true } });
+    expect(git(repo, "log", "-1", "--format=%s")).toBe("feature");
+    writeFileSync(join(repo, "file.txt"), "discard me\n");
+    expect((await checkout.action({
+      ...action, type: "checkout.discard_changes.request", paths: ["file.txt"],
+    })).response).toMatchObject({ payload: { success: true } });
+    expect(git(repo, "status", "--porcelain")).toBe("");
+    expect((await checkout.action({
+      ...action, type: "checkout.refresh.request",
+    })).response).toMatchObject({ payload: { success: true } });
+
+    expect((await checkout.action({
+      ...action, type: "checkout_merge_request", baseRef: "main",
+    })).response).toMatchObject({ payload: { success: false } });
+    expect(git(base, "rev-parse", "HEAD")).toBe(baseSha);
+    expect((await checkout.action({
+      ...action, type: "checkout_push_request",
+    })).response).toMatchObject({ payload: { success: false } });
+    expect(git(remote, "for-each-ref", "refs/heads")).toBe("");
+    await expect(checkout.action({
+      ...action, cwd: base, type: "checkout_commit_request", message: "outside",
+    })).rejects.toThrow("worker_workspace_root_denied");
+  } finally {
+    await checkout.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 it("creates a PR from a restored exact base using the host metadata and a forge branch name", async () => {

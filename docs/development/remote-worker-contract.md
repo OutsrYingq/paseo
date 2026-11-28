@@ -18,6 +18,23 @@ Agent configuration requests apply to the connected worker's agent. Renaming and
 
 The history query searches and pages within the selected worker. Permission requests and resolutions reach subscribed clients in that worker's scope. Responding to a permission request requires `workspace.write`.
 
+## Shared session behavior
+
+Standalone and Central share command discovery, agent configuration, workspace settings, and subscription delivery. Central resolves draft command paths against the worker's home. Each worker's provider snapshot manager uses the standalone background refresh interval.
+
+Central authorizes public requests and binds subscriptions to their client socket. Files, Git, scripts, and provider operations run through typed requests on the admitted resident connection. Update the calls, results, and events in the corresponding domain protocol together. The private connection negotiates workspace operation support before Central sends new operations or advertises their public features.
+
+- `central-directory.ts` owns project and workspace records. Directory inspection and Git worktree materialization run on the resident. Central persists placement and trust metadata, then dispatches setup. Registry mutations drive workspace subscriptions, including workspaces created without agents.
+- `central-checkout.ts` routes checkout requests. The resident invokes the same checkout handlers and diff manager as standalone. Both JSON and binary diff subscriptions use the original resident watcher. Public delivery controls acknowledgment and release.
+- Central archives workspace and agent records before asking the resident to remove an owned checkout. The resident rechecks the archive stamp and live workspace references before removal. Recovery uses the recorded checkout path. Plugin-managed checkouts are retained.
+- The file adapters share the standalone file mutation, observation, and transfer services. Upload bytes stay on the selected resident. Chat attachments resolve by upload ID and the authenticated owner before dispatch. The terminal receives the uploaded file's resident path.
+- The script adapter uses the existing resident terminal manager and stock automation gate. Workspace recipients subscribe to script status on their own worker. Setup and script paths are validated against the resident's configured roots.
+- The worker plugin socket advertises workspace support and answers paginated, non-subscribed workspace reads. Installed plugins use the SDK workspace lookup to prepare the custom OMP runtime. Gallery metadata, source preparation, and reviewed source updates use the resident plugin runtime and its credentials.
+- Each worker scope runs the stock agent message queue against its agent manager. Central checks local sender provenance before accepting an agent message. The receipt fences duplicate dispatch even when delivery waits behind an active turn.
+- Host profile changes and plugin changes share the resident configuration store. The Host settings RPCs patch agent and terminal profiles. The embedding operator owns listen, authentication, Relay, and native provider settings.
+- Usage reports and legacy provider usage come from the resident's usage-source registry. Provider launch environments and credentials stay on that resident. Central streams the report entries to the requesting client.
+- Chat search and the prompt index use the same timeline queries as standalone, against the admitted worker's agent history.
+
 ## Scoped refresh and restart
 
 `refresh_agent_request` requires `workspace.write`. It resolves the agent in the admitted worker's scope, reopens the native session, and loads its provider timeline. The existing per-agent lifecycle lane handles any active turn before reopening. A v0.17.4 refresh leaves the owning workspace's archive and recovery state alone.
@@ -53,4 +70,4 @@ The Central adapter exports a default `CentralOptions` object. The resident adap
 
 Run the focused worker regression with `npm exec -w @getpaseo/server -- vitest run src/server/remote-workers`. This suite uses the server checkout's SDK (0.18.0) and protocol fixtures for Codex and OMP. The test credentials and plugin bundles are generated locally.
 
-This implementation covers direct connections, project and workspace reads, directory workspace creation under an existing project, and agent creation in the selected worker. Installed plugins support listing, logs, reload, enable, disable, and remove with the stock `daemon.manage` permission. Git worktree provisioning, other workspace mutations, plugin source installation and updates, browser automation, worker-local MCP and the AP maintenance transport require additional integration.
+The implemented transport is direct connection over the worker Host. Relay, Hub, service-preview ingress, browser automation, and scheduling require their own integration with the worker identity and lifecycle. Worktree destinations must fall under an admitted resident root. Source installation and checkout operations use the provider and forge configurations on the worker.
