@@ -41,6 +41,7 @@ import { WorkerOperationError } from "./execution-protocol.js";
 import type { createRemoteState } from "./remote-state.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "../agent/agent-loading.js";
 import { AgentConfigSession } from "../session/agent-config/agent-config-session.js";
+import { listAgentCommands } from "../session/agent-config/list-agent-commands.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 
 export type CentralTimelineUpdate = Extract<
@@ -386,6 +387,13 @@ export async function openCentralAgents(
     createAgent,
     createWorkspace,
     sendMessage,
+    listCommands(
+      request: Extract<SessionInboundMessage, { type: "list_commands_request" }>,
+      resolveCwd: (cwd: string) => string | Promise<string>,
+    ) {
+      requireActive();
+      return listAgentCommands(request, { ...dependencies, resolveCwd });
+    },
     cancelAgent: (id: string) => cancelAgentRunCommand(dependencies, id),
     archiveAgent: (id: string) => archiveAgentCommand(dependencies, id),
     async clearAgentAttention(ids: string[]) {

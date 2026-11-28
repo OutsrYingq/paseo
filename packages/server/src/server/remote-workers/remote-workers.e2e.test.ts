@@ -506,6 +506,9 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
     [agentId, "codex"],
     [agentId, "omp"],
   ]);
+  expect((await b.listCommands({ agentId })).commands.map(({ name }) => name)).toContain(
+    "fixture-command",
+  );
   async function checkSessionParity() {
     await expect.poll(() => observedIds).toContain(agentId);
     await a.setAgentModel(agentId, "fixture");

@@ -613,6 +613,14 @@ export async function startRemoteCentral(options: CentralOptions) {
 
       function dispatchAgentCommand(operation: SessionInboundMessage): Promise<void> | undefined {
         switch (operation.type) {
+          case "list_commands_request":
+            return scope
+              .listCommands(operation, async (cwd) => {
+                if (cwd !== "~" && !cwd.startsWith("~/") && !cwd.startsWith("~\\")) return cwd;
+                const home = await scope.connection.call({ kind: "providerHome" });
+                return home + cwd.slice(1);
+              })
+              .then(sendAuthorized);
           case "set_agent_model_request":
             return agentConfigSession.handleSetAgentModelRequest(operation);
           case "set_agent_mode_request":
