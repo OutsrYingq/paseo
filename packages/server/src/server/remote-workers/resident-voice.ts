@@ -39,8 +39,8 @@ export function openResidentVoice(
   publish: (event: RemoteVoiceEvent) => void,
   logger: Logger,
   signal: AbortSignal,
+  mcp = createResidentVoiceMcp(),
 ) {
-  const mcp = createResidentVoiceMcp();
   const sources = new Map<string, VoiceSource>();
   const pending = new Map<string, { source: string; finish(result: VoiceAgentResult): void }>();
   let stopReadiness: (() => void) | undefined;

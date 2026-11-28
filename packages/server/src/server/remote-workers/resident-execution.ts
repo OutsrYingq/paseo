@@ -32,6 +32,7 @@ import {
 import { WorkerBindingSchema, sameWorkerBinding, type WorkerBinding } from "./leases.js";
 import { DICTATION_HEADER, DICTATION_VERSION } from "./remote-dictation-protocol.js";
 import { VOICE_HEADER, VOICE_VERSION, VOICE_OPERATION_KINDS } from "./remote-voice-protocol.js";
+import { BROWSER_HEADER, BROWSER_OPERATION_KINDS, BROWSER_VERSION } from "./remote-browser-protocol.js";
 
 export interface ResidentRuntime {
   execute(operation: Exclude<WorkerOperation, { kind: "restartRuntime" }>): Promise<unknown>;
@@ -40,6 +41,7 @@ export interface ResidentRuntime {
   dictation?: true;
   voice?: true;
   push?: true;
+  browser?: true;
   close(): Promise<void>;
 }
 
@@ -115,6 +117,7 @@ export async function startResidentExecution(options: ResidentExecutionOptions) 
         request.headers[DICTATION_HEADER] === DICTATION_VERSION,
         request.headers[VOICE_HEADER] === VOICE_VERSION,
         request.headers[PUSH_HEADER] === PUSH_VERSION,
+        request.headers[BROWSER_HEADER] === BROWSER_VERSION,
       )
         .catch((error: unknown) => {
           // Stay fenced until the host stops this resident, even if no client is connected.
@@ -178,6 +181,7 @@ async function handleChannel(
   negotiateDictation: boolean,
   negotiateVoice: boolean,
   negotiatePush: boolean,
+  negotiateBrowser: boolean,
 ): Promise<void> {
   const lifetime = new AbortController();
   const inflight = new Map<string, Promise<void>>();
@@ -224,6 +228,7 @@ async function handleChannel(
         (event) => {
           if (!admitted) return;
           if (event.type === "plugin" && event.event.type === "pluginNotification" && !(negotiatePush && admitted.push)) return;
+          if (event.type === "browserAction" && !(negotiateBrowser && admitted.browser)) return;
           send({ kind: "event", event });
         },
         lifetime.signal,
@@ -243,6 +248,7 @@ async function handleChannel(
             ...(negotiateDictation && opened.dictation ? { dictation: true } : {}),
             ...(negotiateVoice && opened.voice ? { voice: true } : {}),
             ...(negotiatePush && opened.push ? { push: true } : {}),
+            ...(negotiateBrowser && opened.browser ? { browser: true } : {}),
           });
         },
         () => socket.terminate(),
@@ -258,6 +264,10 @@ async function handleChannel(
     }
     if (PUSH_OPERATION_KINDS.has(operation.kind) && !(negotiatePush && admitted.push)) {
       send({ kind: "error", id, code: "worker_push_unsupported" });
+      return;
+    }
+    if (BROWSER_OPERATION_KINDS.has(operation.kind) && !(negotiateBrowser && admitted.browser)) {
+      send({ kind: "error", id, code: "worker_browser_unsupported" });
       return;
     }
     if (reset && operation.kind !== "voiceAgentResult") {

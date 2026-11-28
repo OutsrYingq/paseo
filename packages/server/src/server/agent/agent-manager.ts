@@ -425,6 +425,10 @@ export interface AgentManagerOptions {
   terminalManager?: TerminalManager | null;
   mcpBaseUrl?: string;
   mcpAuthToken?: string;
+  resolveAgentMcp?(
+    agentId: string,
+    provider: AgentProvider,
+  ): Promise<{ url: string; token: string } | null>;
   resolveVoiceRuntime?(agentId: string): {
     systemPrompt: string;
     mcpBaseUrl: string;
@@ -968,6 +972,7 @@ export class AgentManager {
   private readonly agentStreamCoalescer: AgentStreamCoalescer;
   private mcpBaseUrl: string | null;
   private readonly mcpAuthToken: string | null;
+  private readonly resolveAgentMcp: AgentManagerOptions["resolveAgentMcp"];
   private readonly resolveVoiceRuntime: AgentManagerOptions["resolveVoiceRuntime"];
   private readonly pluginSessions: PluginSessionsRuntime | undefined;
   private paseoToolsEnabled = true;
@@ -999,6 +1004,7 @@ export class AgentManager {
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
     this.mcpBaseUrl = options?.mcpBaseUrl ?? null;
     this.mcpAuthToken = options?.mcpAuthToken ?? null;
+    this.resolveAgentMcp = options.resolveAgentMcp;
     this.resolveVoiceRuntime = options.resolveVoiceRuntime;
     this.configurePaseoTools(options);
     this.resolvePaseoToolPolicy = options.resolvePaseoToolPolicy ?? (() => undefined);
@@ -6649,13 +6655,21 @@ export class AgentManager {
       ? this.resolvePaseoToolPolicy(storedConfig.provider)
       : { enabled: false };
     const voice = this.resolveVoiceRuntime?.(agentId);
+    const agentMcp =
+      !voice && !storedConfig.mcpServers?.paseo
+        ? await this.resolveAgentMcp?.(agentId, storedConfig.provider)
+        : null;
     const launchConfig = this.applyDaemonAppendSystemPrompt(
       withRuntimePaseoMcpServer({
         config: voice ? { ...storedConfig, systemPrompt: voice.systemPrompt } : storedConfig,
         agentId,
-        mcpBaseUrl: voice?.mcpBaseUrl ??
-          (this.paseoToolsEnabled && isPaseoToolPolicyEnabled(paseoToolPolicy) ? this.mcpBaseUrl : null),
-        mcpAuthToken: voice?.mcpAuthToken ?? this.mcpAuthToken,
+        mcpBaseUrl:
+          voice?.mcpBaseUrl ??
+          agentMcp?.url ??
+          (this.paseoToolsEnabled && isPaseoToolPolicyEnabled(paseoToolPolicy)
+            ? this.mcpBaseUrl
+            : null),
+        mcpAuthToken: voice?.mcpAuthToken ?? agentMcp?.token ?? this.mcpAuthToken,
       }),
     );
     return { storedConfig, launchConfig, paseoToolPolicy };

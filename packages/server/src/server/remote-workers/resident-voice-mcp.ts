@@ -6,8 +6,28 @@ import express from "express";
 import { z } from "zod/v4";
 import type { VoiceSpeakHandler } from "../voice-types.js";
 
-export function createResidentVoiceMcp() {
-  const bindings = new Map<string, { agentId: string; speak: VoiceSpeakHandler }>();
+type AgentBinding = {
+  agentId: string;
+  token: string;
+  speak?: VoiceSpeakHandler;
+  registerBrowser?: (server: McpServer) => void;
+};
+
+export interface ResidentMcpBinding {
+  descriptor: { url: string; token: string };
+  revoke(): boolean;
+}
+
+export interface ResidentAgentMcp {
+  start(): Promise<void>;
+  register(agentId: string, speak: VoiceSpeakHandler): ResidentMcpBinding;
+  registerBrowser(agentId: string, register: NonNullable<AgentBinding["registerBrowser"]>): ResidentMcpBinding;
+  close(): Promise<void>;
+}
+
+export function createResidentVoiceMcp(): ResidentAgentMcp {
+  const agents = new Map<string, AgentBinding>();
+  const bindings = new Map<string, AgentBinding>();
   const app = express();
   const server = createServer(app);
   let ready: Promise<void> | undefined;
@@ -22,14 +42,15 @@ export function createResidentVoiceMcp() {
         res.sendStatus(401);
         return;
       }
-      res.locals.voiceBinding = binding;
+      res.locals.agentBinding = binding;
       next();
     },
     express.json({ limit: "32kb" }),
     async (req, res) => {
-      const binding: { agentId: string; speak: VoiceSpeakHandler } = res.locals.voiceBinding;
+      const binding: AgentBinding = res.locals.agentBinding;
       const mcp = new McpServer({ name: "agent-mcp", version: "2.0.0" });
-      mcp.registerTool(
+      const speak = binding.speak;
+      if (speak) mcp.registerTool(
         "speak",
         {
           title: "Speak",
@@ -38,7 +59,7 @@ export function createResidentVoiceMcp() {
           inputSchema: z.object({ text: z.string().trim().min(1).max(4000) }),
         },
         async ({ text }, context) => {
-          await binding.speak({
+          await speak({
             text,
             callerAgentId: binding.agentId,
             signal: context.mcpReq?.signal,
@@ -49,6 +70,7 @@ export function createResidentVoiceMcp() {
           };
         },
       );
+      binding.registerBrowser?.(mcp);
       const handler = createMcpHandler(() => mcp, { legacy: "stateless" });
       try {
         await toNodeHandler(handler)(req, res, req.body);
@@ -68,6 +90,27 @@ export function createResidentVoiceMcp() {
     return address.port;
   }
 
+  function bind(agentId: string) {
+    let binding = agents.get(agentId);
+    if (!binding) {
+      binding = { agentId, token: randomBytes(32).toString("base64url") };
+      agents.set(agentId, binding);
+      bindings.set(binding.token, binding);
+    }
+    return binding;
+  }
+
+  function release(binding: AgentBinding): boolean {
+    if (binding.speak || binding.registerBrowser || agents.get(binding.agentId) !== binding)
+      return false;
+    agents.delete(binding.agentId);
+    return bindings.delete(binding.token);
+  }
+
+  function descriptor(binding: AgentBinding) {
+    return { url: `http://127.0.0.1:${port()}${path}`, token: binding.token };
+  }
+
   return {
     start(): Promise<void> {
       return (ready ??= new Promise((resolve, reject) => {
@@ -79,14 +122,31 @@ export function createResidentVoiceMcp() {
       }));
     },
     register(agentId: string, speak: VoiceSpeakHandler) {
-      const token = randomBytes(32).toString("base64url");
-      bindings.set(token, { agentId, speak });
+      const binding = bind(agentId);
+      binding.speak = speak;
       return {
-        descriptor: { url: `http://127.0.0.1:${port()}${path}`, token },
-        revoke: () => bindings.delete(token),
+        descriptor: descriptor(binding),
+        revoke() {
+          if (binding.speak !== speak) return false;
+          binding.speak = undefined;
+          return release(binding);
+        },
+      };
+    },
+    registerBrowser(agentId: string, register: NonNullable<AgentBinding["registerBrowser"]>) {
+      const binding = bind(agentId);
+      binding.registerBrowser = register;
+      return {
+        descriptor: descriptor(binding),
+        revoke() {
+          if (binding.registerBrowser !== register) return false;
+          binding.registerBrowser = undefined;
+          return release(binding);
+        },
       };
     },
     async close() {
+      agents.clear();
       bindings.clear();
       await ready?.catch(() => undefined);
       if (!server.listening) return;

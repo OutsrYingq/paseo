@@ -76,6 +76,11 @@ import type { RemoteDictationEvent } from "./remote-dictation-protocol.js";
 import { createCentralVoice, isVoiceInput } from "./central-voice.js";
 import { createCentralNotifications, resolveCentralTerminalAttention } from "./central-notifications.js";
 import { findLatestPermissionRequest } from "@getpaseo/protocol/agent-attention-notification";
+import { BrowserToolsBroker } from "../browser-tools/broker.js";
+import { BrowserToolsSession } from "../browser-tools/session.js";
+import { createCentralBrowserTools } from "./remote-browser-tools.js";
+import type { RemoteBrowserEvent, RemoteBrowserResult } from "./remote-browser-protocol.js";
+import { createBrowserToolCatalogFactory } from "./remote-browser-catalog.js";
 type HostSettingsEvent = Extract<SessionOutboundMessage, { type: "status" }>;
 
 export interface CentralOptions {
@@ -101,6 +106,7 @@ type WorkerScope = Awaited<ReturnType<typeof openCentralAgents>> & {
   hostSettings: ReturnType<typeof createCentralHostSettings>;
   voice: ReturnType<typeof createCentralVoice>;
   notifications: ReturnType<typeof createCentralNotifications>;
+  browserBroker: BrowserToolsBroker;
 };
 const connectionLostEvent = Symbol("connection lost");
 type TimelineSubscriptions = Map<string, ReadonlySet<string>>;
@@ -167,6 +173,7 @@ export async function startRemoteCentral(options: CentralOptions) {
     const scripts = createRemoteScripts(connection);
     const setupObservation = new WorkspaceSetupObservation();
     const voice = createCentralVoice(connection, options.logger);
+    const browserBroker = new BrowserToolsBroker({});
     connection.setEventHandler((event) => {
       if ("processId" in event) providers.onEvent(event);
       else if (event.type === "plugin") plugins.onEvent(event);
@@ -176,6 +183,11 @@ export async function startRemoteCentral(options: CentralOptions) {
       }
       else if (event.type === "voiceAgentAction" || event.type === "voiceOutput") {
         voice.deliver(event);
+      }
+      else if (event.type === "browserAction") {
+        void executeBrowser(event).then((result) =>
+          connection.call({ kind: "browserResult", requestId: event.requestId, result }),
+        ).catch((err) => options.logger.warn({ err }, "Worker browser action failed"));
       }
       else if (
         event.type === "scriptStatus" || event.type === "dictationReadiness" ||
@@ -220,6 +232,16 @@ export async function startRemoteCentral(options: CentralOptions) {
         logger,
         state,
         manager: {
+          async resolveAgentMcp(agentId, provider) {
+            if (!connection.supportsBrowser || provider !== "codex") return null;
+            return connection.call({ kind: "browserBind", agentId, provider });
+          },
+          paseoToolCatalogFactory: createBrowserToolCatalogFactory({
+            readPolicy: () => connection.supportsBrowser
+              ? connection.call({ kind: "browserPolicy", provider: "omp" })
+              : Promise.resolve({ enabled: false }),
+            execute: (agentId, tool, input) => executeBrowser({ agentId, tool, input }),
+          }),
           workspacePaths: {
             resolve: (cwd) => cwd,
             async inspectDirectory(cwd) {
@@ -241,6 +263,36 @@ export async function startRemoteCentral(options: CentralOptions) {
       },
       connection.signal,
     );
+    const browser = opened.then(({ manager }) => createCentralBrowserTools({
+      broker: browserBroker,
+      resolveAgent(agentId) {
+        const agent = manager.getAgent(agentId);
+        return agent && !agent.internal
+          ? { id: agent.id, cwd: agent.cwd, workspaceId: agent.workspaceId }
+          : null;
+      },
+    }));
+    async function executeBrowser(
+      event: Pick<RemoteBrowserEvent, "agentId" | "tool"> & { input: unknown },
+    ): Promise<RemoteBrowserResult> {
+      try {
+        const { manager } = await opened;
+        const workspaceId = manager.getAgent(event.agentId)?.workspaceId;
+        if (workspaceId && event.tool !== "browser_list_hosts") {
+          // The current Desktop selects tabs by workspace ID within its window.
+          for (const [target, pendingScope] of scopeByTarget) {
+            if (target.target.workerId === execution.target.workerId) continue;
+            const { directory } = await pendingScope;
+            if (await directory.workspaceRegistry.get(workspaceId)) {
+              return { ok: false, error: "Browser workspace ID is shared by multiple Hosts" };
+            }
+          }
+        }
+        return await (await browser).execute(event);
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : "Browser action failed" };
+      }
+    }
     const directory = opened.then(async (agents) => {
       const result = createCentralDirectory(logger, state, agents, connection, scripts);
       await result.workspaceLabels?.initialize();
@@ -288,6 +340,11 @@ export async function startRemoteCentral(options: CentralOptions) {
     });
     const scope = opened.then(async (value) => {
       await Promise.all([terminals.initialize(), refreshPlugins()]);
+      if (connection.supportsBrowser) {
+        value.manager.setAgentArchivedCallback(async (agentId) => {
+          await connection.call({ kind: "browserUnbind", agentId });
+        });
+      }
       const workerDirectory = await directory;
       value.manager.setAgentAttentionCallback((event) => {
         const agent = value.manager.getAgent(event.agentId);
@@ -318,12 +375,14 @@ export async function startRemoteCentral(options: CentralOptions) {
         hostSettings: createCentralHostSettings({
           call: (operation) => connection.call(operation),
           serverId: execution.target.serverId,
+          browserSettings: connection.supportsBrowser ? true : undefined,
           onConfigChanged(event) {
             for (const deliver of audiences.get(execution) ?? []) deliver(event);
           },
         }),
         plugins,
         voice,
+        browserBroker,
         notifications,
         directory: workerDirectory,
       });
@@ -639,6 +698,7 @@ export async function startRemoteCentral(options: CentralOptions) {
       let sessionClosed = false;
       const labelsDelivery = new SessionDelivery((_source, update) => sendAuthorized(update));
       labelsDelivery.attach(socket, message.capabilities?.[CLIENT_CAPS.ownedSubscriptions] === true);
+      const browserSession = new BrowserToolsSession(scope.browserBroker, labelsDelivery);
       const directory = createDirectorySubscriptions({
         directory: scope.directory,
         manager: scope.manager,
@@ -1020,6 +1080,8 @@ export async function startRemoteCentral(options: CentralOptions) {
           return;
         }
         if (isVoiceInput(operation)) return voice.dispatch(operation);
+        const browserRequest = browserSession.dispatch(socket, operation);
+        if (browserRequest) return browserRequest;
         if (operation.type === "file.upload.request") return transfers.beginUpload(operation);
         if (operation.type === "file_explorer_request" && scope.connection.supportsWorkspaceOperations) {
           return transfers.explore(operation);
@@ -1305,6 +1367,9 @@ export async function startRemoteCentral(options: CentralOptions) {
       if (!socketLifetime.signal.aborted) {
         sendServerInfo();
         serverInfoSent = true;
+        if (authorization.allowsPermission("workspace.write")) {
+          await browserSession.registerLegacy(socket, message.capabilities?.browser_host);
+        }
       }
     }
   }

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { DICTATION_HEADER, DICTATION_VERSION } from "./remote-dictation-protocol.js";
 import { VOICE_HEADER, VOICE_VERSION, VOICE_OPERATION_KINDS } from "./remote-voice-protocol.js";
+import { BROWSER_HEADER, BROWSER_OPERATION_KINDS, BROWSER_VERSION } from "./remote-browser-protocol.js";
 import { Agent as HttpsAgent } from "node:https";
 import { checkServerIdentity, type ConnectionOptions, type PeerCertificate } from "node:tls";
 import { WebSocket } from "ws";
@@ -58,6 +59,11 @@ export class WorkerConnection {
   private dictation = false;
   private voice = false;
   private push = false;
+  private browser = false;
+
+  get supportsBrowser() {
+    return this.browser;
+  }
 
   get supportsVoice() {
     return this.voice;
@@ -109,6 +115,7 @@ export class WorkerConnection {
         [DICTATION_HEADER]: DICTATION_VERSION,
         [VOICE_HEADER]: VOICE_VERSION,
         [PUSH_HEADER]: PUSH_VERSION,
+        [BROWSER_HEADER]: BROWSER_VERSION,
       },
       followRedirects: false,
       handshakeTimeout: 5_000,
@@ -146,6 +153,7 @@ export class WorkerConnection {
           this.dictation = message.dictation === true;
           this.voice = message.voice === true;
           this.push = message.push === true;
+          this.browser = message.browser === true;
           bound = true;
           clearTimeout(timer);
           resolve();
@@ -186,6 +194,9 @@ export class WorkerConnection {
     }
     if (PUSH_OPERATION_KINDS.has(operation.kind) && !this.push) {
       throw new WorkerOperationError("worker_push_unsupported");
+    }
+    if (BROWSER_OPERATION_KINDS.has(operation.kind) && !this.browser) {
+      throw new WorkerOperationError("worker_browser_unsupported");
     }
     if (WORKSPACE_OPERATION_KINDS.has(operation.kind) && !this.workspaceOperations) {
       throw new WorkerOperationError("worker_workspace_operations_unsupported");

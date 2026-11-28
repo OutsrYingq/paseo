@@ -42,7 +42,6 @@ export function createResidentHostSettings(options: {
   const persisted = loadPersistedConfig(paseoHome, logger);
   const initial = {
     mcp: { injectIntoAgents: false as const },
-    browserTools: { enabled: false as const },
     providers: {},
     metadataGeneration: { providers: [] },
     autoArchiveAfterMerge: false as const,
@@ -55,6 +54,7 @@ export function createResidentHostSettings(options: {
       ...initial,
       ...readProfiles(persisted),
       usage: { enabled: persisted.daemon?.usage?.enabled !== false },
+      browserTools: { enabled: persisted.daemon?.browserTools?.enabled === true },
       metadataGeneration: {
         providers: persisted.agents?.metadataGeneration?.providers ?? [],
         instructions: persisted.agents?.metadataGeneration?.instructions,
@@ -74,6 +74,7 @@ export function createResidentHostSettings(options: {
               ...configStore.get(),
               ...readProfiles(next),
               usage: { enabled: next.daemon?.usage?.enabled !== false },
+              browserTools: { enabled: next.daemon?.browserTools?.enabled === true },
               metadataGeneration: {
                 providers: next.agents?.metadataGeneration?.providers ?? [],
                 instructions: next.agents?.metadataGeneration?.instructions,
@@ -86,7 +87,7 @@ export function createResidentHostSettings(options: {
     },
   );
 
-  function readConfig() {
+  function readConfig(includeBrowser: boolean | undefined) {
     const { agentProfiles, terminalProfiles, pluginsEnabled, usage, metadataGeneration } = toWireDaemonConfig(
       configStore.get(),
     );
@@ -97,6 +98,7 @@ export function createResidentHostSettings(options: {
       pluginsEnabled,
       usage,
       metadataGeneration,
+      browserTools: { enabled: includeBrowser === true && configStore.get().browserTools.enabled === true },
     });
   }
 
@@ -123,10 +125,10 @@ export function createResidentHostSettings(options: {
     async execute(operation: RemoteHostSettingsOperation) {
       switch (operation.kind) {
         case "hostSettingsGet":
-          return readConfig();
+          return readConfig(operation.browserSettings);
         case "hostSettingsPatch": {
           const patch = RemoteHostConfigPatchSchema.safeParse(operation.config);
-          if (!patch.success)
+          if (!patch.success || (patch.data.browserTools && !operation.browserSettings))
             throw new WorkerOperationError("worker_host_settings_patch_unsupported");
           if (Object.keys(patch.data).length) {
             await configStore.patch((current) => ({
@@ -145,10 +147,10 @@ export function createResidentHostSettings(options: {
               }),
             }));
           }
-          return readConfig();
+          return readConfig(operation.browserSettings);
         }
         case "hostSettingsReload":
-          return { ...(await configStore.reload()), config: readConfig() };
+          return { ...(await configStore.reload()), config: readConfig(operation.browserSettings) };
         case "hostStatus":
           return readStatus(operation.includeProviders !== false);
         case "hostDiagnostics": {

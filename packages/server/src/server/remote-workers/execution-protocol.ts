@@ -57,6 +57,7 @@ import {
 } from "./remote-dictation-protocol.js";
 
 import { RemoteVoiceEvents, RemoteVoiceOperations, remoteVoiceResults } from "./remote-voice-protocol.js";
+import { RemoteBrowserEvents, RemoteBrowserOperations, remoteBrowserResults } from "./remote-browser-protocol.js";
 import { RemotePushOperationSchema, remotePushResults } from "./remote-push.js";
 
 export const PUSH_HEADER = "x-paseo-push";
@@ -116,6 +117,7 @@ export const WorkerOperationSchema = z.discriminatedUnion("kind", [
   ...RemoteProjectIconOperationSchema.options,
   ...RemoteDictationOperations,
   ...RemoteVoiceOperations,
+  ...RemoteBrowserOperations,
   ...RemotePushOperationSchema.options,
   z.strictObject({
     kind: z.literal("explore"),
@@ -202,6 +204,7 @@ const WorkerEventSchema = z.discriminatedUnion("type", [
   RemoteWorktreeSetupEventSchema,
   ...RemoteDictationEvents,
   ...RemoteVoiceEvents,
+  ...RemoteBrowserEvents,
   z.strictObject({ type: z.literal("fileVersion"), id: z.uuid(), version: FileVersionSchema }),
   z.strictObject({
     type: z.literal("output"),
@@ -226,6 +229,7 @@ export const ExecutionResponseSchema = z.discriminatedUnion("kind", [
     dictation: z.literal(true).optional(),
     voice: z.literal(true).optional(),
     push: z.literal(true).optional(),
+    browser: z.literal(true).optional(),
   }),
   z.strictObject({
     kind: z.literal("result"),
@@ -277,6 +281,7 @@ export const operationResults = {
   ...remoteProjectIconResults,
   ...remoteDictationResults,
   ...remoteVoiceResults,
+  ...remoteBrowserResults,
   ...remotePushResults,
   ...remoteTerminalOperationResults,
   plugin: RemotePluginResultSchema,

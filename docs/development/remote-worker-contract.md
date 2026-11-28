@@ -40,6 +40,7 @@ Central authorizes public requests and binds subscriptions to their client socke
 - Dictation runs the stock stream manager and configured speech provider on the resident. The execution handshake negotiates dictation separately, and the Central socket that started the recording owns its events and cleanup.
 - Voice mode uses the same worker speech service. Central binds each voice source to one agent. The resident's loopback `speak` capability is injected into the provider launch only and revoked when the source closes.
 - Agent, terminal, and plugin notifications use the standalone presence and preference rules. The worker stores its own device tokens and delivers pushes with its original `serverId`.
+- Browser tools use one broker per worker. Agent tool calls use Codex's resident MCP connection or OMP's native host tool channel. The resident stores browser tool policy, and Central rejects ambiguous workspace IDs before sending a command to Desktop.
 
 ## Scoped refresh and restart
 

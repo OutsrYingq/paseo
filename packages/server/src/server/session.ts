@@ -18,7 +18,7 @@ import {
 } from "./session/agent-history/agent-orchestration.js";
 import { queryAgentTimeline } from "./session/agent-history/timeline-query.js";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
-import { BrowserAutomationHostCapabilitySchema } from "@getpaseo/protocol/browser-automation/capabilities";
+import { BrowserToolsSession } from "./browser-tools/session.js";
 import type {
   SessionEventSubscription,
   UsageReportEntry,
@@ -798,7 +798,7 @@ export class Session {
         "Unrecognized reply contract; application delivery denied",
       ),
   );
-  private readonly browserToolsBroker: SessionOptions["browserToolsBroker"];
+  private readonly browserTools: BrowserToolsSession;
   private readonly createNetworkTunnelTicket: SessionOptions["createNetworkTunnelTicket"];
   private readonly clientId: string;
   private readonly authorization: SessionAuthorization;
@@ -979,7 +979,7 @@ export class Session {
       daemonRuntimeConfig,
       getWebSocketRuntimeMetrics,
     } = options;
-    this.browserToolsBroker = options.browserToolsBroker;
+    this.browserTools = new BrowserToolsSession(options.browserToolsBroker, this.delivery);
     this.createNetworkTunnelTicket = createNetworkTunnelTicket;
     this.clientId = clientId;
     this.authorization = new SessionAuthorization(permissions);
@@ -1468,26 +1468,10 @@ export class Session {
       });
       this.refreshObservationProducers();
       // COMPAT(ownedSubscriptions): added in v0.8.0, remove capability-driven legacy host registration after 2027-03-09.
-      if (
-        !this.delivery.isModern(source) &&
-        this.authorization.allowsPermission("workspace.write")
-      ) {
-        const host = BrowserAutomationHostCapabilitySchema.safeParse(capabilities?.browser_host);
-        if (host.success && this.browserToolsBroker) {
-          const request = {
-            type: "browser.host.register.request" as const,
-            requestId: uuidv4(),
-            hostKind: host.data.hostKind,
-            label: host.data.label,
-            instanceId: host.data.instanceId,
-            supportedCommands: host.data.supportedCommands,
-          };
-          void this.delivery
-            .request(source, request, () => this.registerBrowserHost(request, false))
-            .catch((error) =>
-              this.sessionLogger.warn({ err: error }, "Failed to register legacy browser host"),
-            );
-        }
+      if (this.authorization.allowsPermission("workspace.write")) {
+        void this.browserTools.registerLegacy(source, capabilities?.browser_host)?.catch((error) =>
+          this.sessionLogger.warn({ err: error }, "Failed to register legacy browser host"),
+        );
       }
     }
   }
@@ -2516,11 +2500,9 @@ export class Session {
     this.authorization.replacePermissions(permissions);
     this.connectedHostSession?.revoke();
     if (!this.authorization.allowsPermission("workspace.write")) {
-      void this.delivery
-        .releaseFamily("browser-host")
-        .catch((error) =>
-          this.sessionLogger.error({ err: error }, "Failed to release revoked browser hosting"),
-        );
+      void this.browserTools.revoke().catch((error) =>
+        this.sessionLogger.error({ err: error }, "Failed to release revoked browser hosting"),
+      );
     }
     // Binary plugin events skip the outbound permission check, so revocation ends the streams.
     if (!this.authorization.allowsPermission("daemon.manage")) {
@@ -2586,33 +2568,6 @@ export class Session {
 
   public publish(message: SessionOutboundMessage): void {
     this.emit(message);
-  }
-
-  private async registerBrowserHost(
-    request: Extract<SessionInboundMessage, { type: "browser.host.register.request" }>,
-    respond = true,
-  ): Promise<void> {
-    if (!this.browserToolsBroker) throw new Error("Browser hosting is unavailable");
-    let unregister: (() => void) | undefined;
-    const owner = this.delivery.begin("browser-host", undefined, () => unregister?.());
-    try {
-      unregister = this.browserToolsBroker.registerClient({
-        id: owner.id,
-        hostKind: request.hostKind,
-        label: request.label,
-        instanceId: request.instanceId,
-        supportedCommands: request.supportedCommands,
-        sendBrowserAutomationRequest: (message) => owner.emit(message),
-      });
-      if (respond)
-        this.emit({
-          type: "browser.host.register.response",
-          payload: { requestId: request.requestId, subscriptionId: owner.responseId },
-        });
-    } catch (error) {
-      await owner.release();
-      throw error;
-    }
   }
 
   private async subscribeWorkspaceSetup(
@@ -2684,17 +2639,10 @@ export class Session {
     source?: object,
   ): Promise<void> | undefined {
     if (msg.type === "workspace.setup.subscribe.request") return this.subscribeWorkspaceSetup(msg);
-    if (msg.type === "browser.host.register.request") return this.registerBrowserHost(msg);
+    const browsing = this.browserTools.dispatch(source, msg);
+    if (browsing) return browsing;
     if (msg.type === "provider.installation.update.subscribe.request")
       return this.subscribeProviderUpdates(msg);
-    if (msg.type === "browser.automation.execute.response") {
-      if (source)
-        this.browserToolsBroker?.receiveResponse(
-          msg,
-          this.delivery.subscriptionIds(source, "browser-host"),
-        );
-      return Promise.resolve();
-    }
     if (msg.type === "subscription.release.request") {
       return this.delivery.release(msg.subscriptionId).then(() => {
         this.emit({

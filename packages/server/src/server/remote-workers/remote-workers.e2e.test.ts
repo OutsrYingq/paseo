@@ -79,6 +79,9 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
       fs.writeFileSync(process.env.FIXTURE_STATE + '/last-prompt', turnInput);
     }
     if (method === 'thread/start' || method === 'thread/resume') fs.writeFileSync(process.env.FIXTURE_STATE + '/session-pid', String(process.pid));
+    if (method === 'thread/start' && command.params?.config?.mcp_servers?.paseo) {
+      fs.writeFileSync(process.env.FIXTURE_STATE + '/agent-mcp', JSON.stringify(command.params.config.mcp_servers.paseo));
+    }
     if (method === 'thread/resume') fs.appendFileSync(process.env.FIXTURE_STATE + '/resumes', 'resume\n');
     const result = ({ initialize: { userAgent: 'codex/0.121.0' }, 'model/list': { data: [{ id: 'fixture', model: 'fixture', isDefault: true, displayName: 'Fixture', description: 'fixture', hidden: false, supportedReasoningEfforts: [], defaultReasoningEffort: 'medium' }] }, 'thread/start': { thread: { id: 'shared-native-id' } }, 'thread/resume': { thread: { id: 'shared-native-id' } }, 'thread/read': { thread: { id: 'shared-native-id', turns: [{ id: 't1', status: 'interrupted', items: [{ id: 'rehydrated', type: 'userMessage', content: [{ type: 'text', text: 'provider history', text_elements: [] }] }] }] } }, 'turn/start': { turn: { id: 't1', status: 'inProgress' } } })[method] ?? {};
     if (id === 8001) {
@@ -699,6 +702,8 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
       path.join(local, "config.json"),
       JSON.stringify({
         pluginsEnabled: true,
+        daemon: { browserTools: { enabled: provider === "codex" } },
+        features: { dictation: { enabled: false }, voiceMode: { enabled: false } },
         ...(provider === "codex" && {
           agents: {
             metadataGeneration: {
@@ -980,6 +985,34 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
   expect((await b.listCommands({ agentId })).commands.map(({ name }) => name)).toContain(
     "fixture-command",
   );
+  const browserA = a.registerBrowserHost({
+    hostKind: "desktop app", label: "browser-a", supportedCommands: ["list_tabs"],
+  });
+  const browserB = b.registerBrowserHost({
+    hostKind: "desktop app", label: "browser-b", supportedCommands: ["list_tabs"],
+  });
+  cleanups.push(() => browserA.release(), () => browserB.release());
+  await Promise.all([browserA.ready, browserB.ready]);
+  const mcp = JSON.parse(await readFile(path.join(root, "a", "agent-mcp"), "utf8"));
+  const browserCall = async (name: string) =>
+    (await fetch(mcp.url, {
+      method: "POST",
+      headers: {
+        ...mcp.http_headers,
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2025-06-18",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: {} },
+      }),
+    })).text();
+  const discoveredBrowsers = await browserCall("browser_list_hosts");
+  expect(discoveredBrowsers).toContain("browser-a");
+  expect(discoveredBrowsers).not.toContain("browser-b");
+  expect(await browserCall("browser_list_tabs")).toContain("Browser workspace ID is shared by multiple Hosts");
+  await Promise.all([browserA.release(), browserB.release()]);
+  expect(await browserCall("browser_list_hosts")).not.toContain("browser-a");
   async function checkSessionParity() {
     await expect.poll(() => observedIds).toContain(agentId);
     await a.setAgentModel(agentId, "fixture");

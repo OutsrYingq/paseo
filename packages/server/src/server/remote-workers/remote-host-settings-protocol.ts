@@ -18,6 +18,8 @@ export const remoteHostProfileControlKeys = Object.keys(profileControls.shape);
 const agentProfile = AgentProfileSchema.strip();
 const terminalProfile = TerminalProfileSchema.strip();
 const usage = z.strictObject({ enabled: z.boolean() });
+const browserTools = z.strictObject({ enabled: z.boolean() });
+const browserSettings = z.literal(true).optional();
 
 export const RemoteHostConfigPatchSchema = z.strictObject({
   agentProfiles: z
@@ -33,6 +35,7 @@ export const RemoteHostConfigPatchSchema = z.strictObject({
   terminalProfiles: z.array(terminalProfile.strict()).optional(),
   usage: usage.optional(),
   metadataGeneration: AgentMetadataGenerationSchema.optional(),
+  browserTools: browserTools.optional(),
 });
 
 export const RemoteHostConfigSchema = z.strictObject({
@@ -45,7 +48,7 @@ export const RemoteHostConfigSchema = z.strictObject({
   ),
   terminalProfiles: z.array(terminalProfile).optional(),
   pluginsEnabled: z.boolean().optional(),
-  browserTools: z.strictObject({ enabled: z.literal(false) }),
+  browserTools,
   providers: z.strictObject({}),
   metadataGeneration: AgentMetadataGenerationSchema.required({ providers: true }),
   usage: usage.optional(),
@@ -57,9 +60,9 @@ export const RemoteHostConfigSchema = z.strictObject({
 export type RemoteHostConfig = z.output<typeof RemoteHostConfigSchema>;
 
 export const RemoteHostSettingsOperationSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("hostSettingsGet") }),
-  z.strictObject({ kind: z.literal("hostSettingsPatch"), config: RemoteHostConfigPatchSchema }),
-  z.strictObject({ kind: z.literal("hostSettingsReload") }),
+  z.strictObject({ kind: z.literal("hostSettingsGet"), browserSettings }),
+  z.strictObject({ kind: z.literal("hostSettingsPatch"), config: RemoteHostConfigPatchSchema, browserSettings }),
+  z.strictObject({ kind: z.literal("hostSettingsReload"), browserSettings }),
   z.strictObject({ kind: z.literal("hostStatus"), includeProviders: z.boolean().optional() }),
   z.strictObject({ kind: z.literal("hostDiagnostics") }),
 ]);

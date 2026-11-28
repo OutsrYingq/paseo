@@ -1,4 +1,4 @@
-import { describe, expect, onTestFinished, test } from "vitest";
+import { describe, expect, onTestFinished, test, vi } from "vitest";
 import { setImmediate as waitForImmediate } from "node:timers/promises";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -12,6 +12,7 @@ import type { OmpUsagePollScheduler } from "./usage-poller.js";
 import { resolveOmpProviderOptions } from "./provider-config.js";
 import { OmpRuntimeEventSchema, OmpSessionStateSchema } from "./rpc-types.js";
 import { OmpHarness } from "./test-utils/omp-harness.js";
+import { OmpMcpBridge } from "./mcp-bridge.js";
 import { OmpAgentClient } from "./agent.js";
 import { FakeOmp } from "./test-utils/fake-omp.js";
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
@@ -293,6 +294,53 @@ describe("OMP agent client and session", () => {
     expect(omp.capabilities()).toMatchObject({
       supportsMcpServers: true,
       supportsNativePaseoTools: true,
+    });
+  });
+
+  test("routes the remote OMP catalog without connecting configured MCP servers", async () => {
+    const connect = vi.spyOn(OmpMcpBridge, "connect");
+    onTestFinished(() => connect.mockRestore());
+    const runtime = new FakeOmp();
+    const client = new OmpAgentClient({
+      logger: createTestLogger(),
+      runtime,
+      executionIsRemote: true,
+    });
+    const tool = {
+      name: "browser_list_hosts",
+      description: "List browser hosts for this worker.",
+      handler: async () => ({ content: [{ type: "text", text: "Worker desktop" }] }),
+    };
+    const session = await client.createSession({
+      provider: "omp",
+      cwd: process.cwd(),
+      mcpServers: { local: { type: "http", url: "http://127.0.0.1:1/mcp" } },
+    }, {
+      paseoTools: {
+        tools: new Map([[tool.name, tool]]),
+        getTool: (name) => (name === tool.name ? tool : undefined),
+        executeTool: (name) => {
+          if (name !== tool.name) throw new Error(`Unexpected tool: ${name}`);
+          return tool.handler();
+        },
+      },
+    });
+    onTestFinished(() => session.close());
+
+    const native = runtime.latestSession();
+    expect(native.hostToolSetRequests).toEqual([[expect.objectContaining({ name: tool.name })]]);
+    expect(connect).not.toHaveBeenCalled();
+    const result = native.nextHostToolResult();
+    native.emit({
+      type: "host_tool_call",
+      id: "browser-call",
+      toolCallId: "tool-1",
+      toolName: tool.name,
+      arguments: {},
+    });
+    expect(await result).toMatchObject({
+      id: "browser-call",
+      result: { content: [{ type: "text", text: "Worker desktop" }] },
     });
   });
 

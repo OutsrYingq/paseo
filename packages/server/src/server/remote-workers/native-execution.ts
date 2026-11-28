@@ -63,6 +63,9 @@ import { createSpeechService, type SpeechService } from "../speech/speech-runtim
 import { openResidentDictation } from "./resident-dictation.js";
 import { openResidentVoice } from "./resident-voice.js";
 import { createResidentPush } from "./remote-push.js";
+import { createResidentVoiceMcp } from "./resident-voice-mcp.js";
+import { openResidentBrowser } from "./resident-browser.js";
+import { ProviderOverrideSchema } from "../agent/provider-launch-config.js";
 
 interface OwnedProcess {
   child: ChildProcessWithoutNullStreams;
@@ -107,6 +110,14 @@ export function createNativeExecution(options: NativeExecutionOptions) {
     listNativeProviders,
   });
   let hostSettings = makeHostSettings();
+  function readBrowserPolicy(provider: "codex" | "omp") {
+    const enabled = hostSettings.configStore.get().browserTools.enabled === true;
+    if (!enabled) return { enabled };
+    const settings = ProviderOverrideSchema.safeParse(
+      loadPersistedConfig(options.paseoHome, logger).agents?.providers?.[provider],
+    );
+    return { enabled, providerPolicy: settings.data?.paseoTools };
+  }
   let push: ReturnType<typeof createResidentPush> | undefined;
   let speech: SpeechService | undefined;
   function readSpeechConfig() {
@@ -183,7 +194,14 @@ export function createNativeExecution(options: NativeExecutionOptions) {
     );
     const owner = Symbol("worker link");
     const dictation = openResidentDictation(getSpeech, publish, logger);
-    const voice = openResidentVoice(getSpeech, publish, logger, signal);
+    const mcp = createResidentVoiceMcp();
+    const voice = openResidentVoice(getSpeech, publish, logger, signal, mcp);
+    const browser = openResidentBrowser({
+      mcp,
+      publish,
+      signal,
+      resolvePolicy: readBrowserPolicy,
+    });
     const setupRuntime = new WorkspaceSetupRuntime();
     const runningSetup = new Set<string>();
     const stopSetup = () => Promise.all([...runningSetup].map((id) => setupRuntime.stop(id)));
@@ -484,6 +502,7 @@ export function createNativeExecution(options: NativeExecutionOptions) {
       dictation: true,
       voice: true,
       push: true,
+      browser: true,
       async execute(operation) {
         signal.throwIfAborted();
         if ("processId" in operation) return executeProcess(operation);
@@ -500,6 +519,12 @@ export function createNativeExecution(options: NativeExecutionOptions) {
           case "hostStatus":
           case "hostDiagnostics":
             return hostSettings.execute(operation);
+          case "browserPolicy":
+            return readBrowserPolicy(operation.provider);
+          case "browserBind":
+          case "browserUnbind":
+          case "browserResult":
+            return browser.execute(operation);
           case "dictationReadiness":
           case "dictationInput":
           case "dictationClose":
@@ -665,6 +690,7 @@ export function createNativeExecution(options: NativeExecutionOptions) {
       },
       async restartRuntime(keepTerminals) {
         dictation.close();
+        browser.close();
         await voice.close();
         await speech?.stop();
         speech = undefined;
@@ -677,6 +703,7 @@ export function createNativeExecution(options: NativeExecutionOptions) {
       },
       async close() {
         dictation.close();
+        browser.close();
         await voice.close();
         terminalChannel.dispose();
         scriptChannel.close();
