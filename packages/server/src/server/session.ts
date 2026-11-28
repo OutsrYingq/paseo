@@ -3614,19 +3614,15 @@ export class Session {
       case "file_explorer_request":
         return this.workspaceFilesSession.handleFileExplorerRequest(msg, source);
       case "fs.file.subscribe.request":
-        return this.workspaceFilesSession.handleFileSubscribeRequest(msg, this.delivery);
+        return this.workspaceFilesSession.observation.handleFileSubscribeRequest(msg, this.delivery);
       case "fs.file.unsubscribe.request":
-        return this.workspaceFilesSession.handleFileUnsubscribeRequest(msg, this.delivery);
+        return this.workspaceFilesSession.observation.handleFileUnsubscribeRequest(msg, this.delivery);
       case "fs.file.write.request":
-        return this.workspaceFilesSession.handleFileWriteRequest(msg);
       case "fs.entry.create.request":
-        return this.workspaceFilesSession.handleFileEntryCreateRequest(msg);
       case "fs.entry.rename.request":
-        return this.workspaceFilesSession.handleFileEntryRenameRequest(msg);
       case "fs.entry.duplicate.request":
-        return this.workspaceFilesSession.handleFileEntryDuplicateRequest(msg);
       case "fs.entry.delete.request":
-        return this.workspaceFilesSession.handleFileEntryDeleteRequest(msg);
+        return this.workspaceFilesSession.handleFileMutation(msg);
       case "project_icon_request":
         return this.workspaceFilesSession.handleProjectIconRequest(msg);
       case "project.icon.get.request":
