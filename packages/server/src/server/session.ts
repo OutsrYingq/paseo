@@ -108,7 +108,7 @@ import { releaseWorkspaceServicePortPlan } from "./workspace-service-port-regist
 import { getErrorMessage, getErrorMessageOr } from "@getpaseo/protocol/error-utils";
 import { createAgentDirectoryPager } from "./agent/directory-pager.js";
 import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
-import { applyRecordPatch } from "./record-patch.js";
+import { changeWorkspaceSettings } from "./session/workspace-provisioning/workspace-settings.js";
 import type { WorkspaceGitRuntimeSnapshot, WorkspaceGitService } from "./workspace-git-service.js";
 import type { ProjectUpdate } from "./workspace-reconciliation-service.js";
 import {
@@ -2835,7 +2835,7 @@ export class Session {
       case "agent.metadata.update.request":
         return this.handleAgentMetadataUpdateRequest(msg);
       case "workspace.metadata.update.request":
-        return this.handleWorkspaceMetadataUpdateRequest(msg);
+        return this.handleWorkspaceSettingsRequest(msg);
       default:
         return undefined;
     }
@@ -3569,9 +3569,9 @@ export class Session {
       case "project.remove.request":
         return this.handleProjectRemoveRequest(msg);
       case "workspace.title.set.request":
-        return this.handleWorkspaceTitleSetRequest(msg.workspaceId, msg.title, msg.requestId);
+        return this.handleWorkspaceSettingsRequest(msg);
       case "workspace.pin.set.request":
-        return this.handleWorkspacePinSetRequest(msg.workspaceId, msg.pinned, msg.requestId);
+        return this.handleWorkspaceSettingsRequest(msg);
       case "workspace.base_branch.set.request":
         return this.handleWorkspaceBaseBranchSetRequest(msg);
       default:
@@ -4380,75 +4380,13 @@ export class Session {
     }
   }
 
-  private async handleWorkspaceTitleSetRequest(
-    workspaceId: string,
-    title: string | null,
-    requestId: string,
+  private async handleWorkspaceSettingsRequest(
+    request: Parameters<typeof changeWorkspaceSettings>[1],
   ): Promise<void> {
-    this.sessionLogger.info(
-      { workspaceId, requestId, hasTitle: typeof title === "string" },
-      "session: workspace.title.set.request",
-    );
-
-    try {
-      const trimmed = title?.trim() ?? "";
-      const nextTitle = trimmed.length === 0 ? null : trimmed;
-      const updatedAt = new Date().toISOString();
-      const updated = await this.workspaceRegistry.update(workspaceId, (existing) => ({
-        ...existing,
-        title: nextTitle,
-        updatedAt,
-      }));
-      if (!updated) {
-        this.emit({
-          type: "workspace.title.set.response",
-          payload: {
-            requestId,
-            workspaceId,
-            accepted: false,
-            title: null,
-            error: "Workspace not found",
-          },
-        });
-        return;
-      }
-
-      this.emit({
-        type: "workspace.title.set.response",
-        payload: {
-          requestId,
-          workspaceId,
-          accepted: true,
-          title: nextTitle,
-          error: null,
-        },
-      });
-
-      await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
-    } catch (error) {
-      this.sessionLogger.error(
-        { err: error, workspaceId, requestId },
-        "session: workspace.title.set.request error",
-      );
-      this.emit({
-        type: "activity_log",
-        payload: {
-          id: uuidv4(),
-          timestamp: new Date(),
-          type: "error",
-          content: `Failed to set workspace title: ${getErrorMessage(error)}`,
-        },
-      });
-      this.emit({
-        type: "workspace.title.set.response",
-        payload: {
-          requestId,
-          workspaceId,
-          accepted: false,
-          title: null,
-          error: getErrorMessageOr(error, "Failed to set workspace title"),
-        },
-      });
+    const response = await changeWorkspaceSettings(this.workspaceRegistry, request);
+    this.emit(response);
+    if (response.payload.accepted) {
+      await this.emitWorkspaceUpdatesForWorkspaceIds([request.workspaceId]);
     }
   }
 
@@ -4478,50 +4416,6 @@ export class Session {
           error: getErrorMessageOr(error, "Failed to update agent metadata"),
         },
       });
-    }
-  }
-
-  private async handleWorkspaceMetadataUpdateRequest(
-    request: Extract<SessionInboundMessage, { type: "workspace.metadata.update.request" }>,
-  ): Promise<void> {
-    const { workspaceId, patch, requestId } = request;
-    this.sessionLogger.info(
-      { workspaceId, requestId },
-      "session: workspace.metadata.update.request",
-    );
-    const reject = (error: string) =>
-      this.emit({
-        type: "workspace.metadata.update.response",
-        payload: { requestId, workspaceId, accepted: false, metadata: null, error },
-      });
-    try {
-      const updatedAt = new Date().toISOString();
-      const updated = await this.workspaceRegistry.update(workspaceId, (existing) => ({
-        ...existing,
-        metadata: applyRecordPatch(existing.metadata, patch),
-        updatedAt,
-      }));
-      if (!updated) {
-        reject("Workspace not found");
-        return;
-      }
-      this.emit({
-        type: "workspace.metadata.update.response",
-        payload: {
-          requestId,
-          workspaceId,
-          accepted: true,
-          metadata: updated.metadata,
-          error: null,
-        },
-      });
-      await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
-    } catch (error) {
-      this.sessionLogger.error(
-        { err: error, workspaceId, requestId },
-        "session: workspace.metadata.update.request error",
-      );
-      reject(getErrorMessageOr(error, "Failed to update workspace metadata"));
     }
   }
 
@@ -4557,52 +4451,6 @@ export class Session {
           error: getErrorMessage(error),
         },
       });
-    }
-  }
-
-  private async handleWorkspacePinSetRequest(
-    workspaceId: string,
-    pinned: boolean,
-    requestId: string,
-  ): Promise<void> {
-    const logContext = { workspaceId, pinned, requestId };
-    this.sessionLogger.info(logContext, "session: workspace.pin.set.request");
-    const emitResponse = (accepted: boolean, pinnedAt: string | null, error: string | null) => {
-      this.emit({
-        type: "workspace.pin.set.response",
-        payload: { requestId, workspaceId, accepted, pinnedAt, error },
-      });
-    };
-
-    try {
-      const nextPinnedAt = pinned ? new Date().toISOString() : null;
-      const updatedAt = new Date().toISOString();
-      const updated = await this.workspaceRegistry.update(workspaceId, (existing) => ({
-        ...existing,
-        pinnedAt: nextPinnedAt,
-        updatedAt,
-      }));
-      if (!updated) {
-        emitResponse(false, null, "Workspace not found");
-        return;
-      }
-      emitResponse(true, nextPinnedAt, null);
-      await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
-    } catch (error) {
-      this.sessionLogger.error(
-        { ...logContext, err: error },
-        "session: workspace.pin.set.request error",
-      );
-      this.emit({
-        type: "activity_log",
-        payload: {
-          id: uuidv4(),
-          timestamp: new Date(),
-          type: "error",
-          content: `Failed to pin workspace: ${getErrorMessage(error)}`,
-        },
-      });
-      emitResponse(false, null, getErrorMessageOr(error, "Failed to pin workspace"));
     }
   }
 

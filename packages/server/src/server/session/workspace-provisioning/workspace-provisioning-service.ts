@@ -20,6 +20,10 @@ import {
 import type { WorkspaceGitService } from "../../workspace-git-service.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.js";
 import { deriveProjectKey } from "../../project-key.js";
+import {
+  projectRegistrationForCheckout,
+  registerProjectDirectory,
+} from "../../project-registration.js";
 import { areEquivalentPaths, createRealpathAwarePathMatcher } from "../../../utils/path.js";
 import type { UntrustedWorkspaceSource } from "../../workspace-automation-gate.js";
 import { readPaseoWorktreeMetadata } from "../../../utils/worktree-metadata.js";
@@ -211,20 +215,10 @@ export function createWorkspaceProvisioningService(deps: {
   async function findOrCreateProjectForDirectory(cwd: string): Promise<PersistedProjectRecord> {
     const rootPath = resolve(cwd);
     const checkout = await workspaceGitService.getCheckout(rootPath);
-    const timestamp = new Date().toISOString();
-    return projectRegistry.getOrCreateActiveByRoot({
-      rootPath,
-      kind: checkout.isGit ? "git" : "non_git",
-      displayName: basename(rootPath) || rootPath,
-      projectKey: deriveProjectKey({
-        rootPath,
-        remoteUrl: checkout.remoteUrl,
-        worktreeRoot: checkout.worktreeRoot,
-        mainRepoRoot: checkout.mainRepoRoot,
-        serverId,
-      }),
-      timestamp,
-    });
+    return registerProjectDirectory(
+      projectRegistry,
+      projectRegistrationForCheckout(checkout, serverId),
+    );
   }
 
   async function requireActiveProject(projectId: string): Promise<PersistedProjectRecord> {
