@@ -1,14 +1,16 @@
-﻿import { createServer, type ServerOptions } from "node:https";
+import { createServer, type ServerOptions } from "node:https";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { TLSSocket } from "node:tls";
 import type { AddressInfo } from "node:net";
-import WebSocket, { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import {
+  EXECUTION_FEATURES_HEADER,
   EXECUTION_MAX_CALLS,
   EXECUTION_MAX_FRAME,
   EXECUTION_PATH,
   EXECUTION_PROTOCOL,
+  RUNTIME_RESTART_FEATURE,
   ExecutionRequestSchema,
   WorkerOperationError,
   decodeJson,
@@ -19,7 +21,8 @@ import {
 import { WorkerBindingSchema, sameWorkerBinding, type WorkerBinding } from "./leases.js";
 
 export interface ResidentRuntime {
-  execute(operation: WorkerOperation): Promise<unknown>;
+  execute(operation: Exclude<WorkerOperation, { kind: "restartRuntime" }>): Promise<unknown>;
+  restartRuntime?(keepTerminals: boolean): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -78,7 +81,12 @@ export async function startResidentExecution(options: ResidentExecutionOptions) 
     }
     upgrades.handleUpgrade(request, stream, head, (connected) => {
       socket = connected;
-      active = handleChannel(connected, ownBinding, options)
+      active = handleChannel(
+        connected,
+        ownBinding,
+        options,
+        request.headers[EXECUTION_FEATURES_HEADER] === RUNTIME_RESTART_FEATURE,
+      )
         .catch((error: unknown) => {
           fenced = true;
           options.onError(error);
@@ -115,11 +123,13 @@ async function handleChannel(
   socket: WebSocket,
   binding: WorkerBinding,
   options: ResidentExecutionOptions,
+  negotiateRestart: boolean,
 ): Promise<void> {
   const lifetime = new AbortController();
   const inflight = new Map<string, Promise<void>>();
   let runtime: Promise<ResidentRuntime> | undefined;
   let admitted: ResidentRuntime | undefined;
+  let reset: Promise<void> | undefined;
   const timer = setTimeout(() => socket.terminate(), 10_000);
   let alive = true;
   socket.on("pong", () => {
@@ -167,7 +177,11 @@ async function handleChannel(
         (opened) => {
           admitted = opened;
           clearTimeout(timer);
-          send({ kind: "bound", binding });
+          return send({
+            kind: "bound",
+            binding,
+            ...(negotiateRestart && opened.restartRuntime ? { restartRuntime: true } : {}),
+          });
         },
         () => socket.terminate(),
       );
@@ -175,8 +189,28 @@ async function handleChannel(
     }
     if (!admitted || inflight.has(message.id) || inflight.size >= EXECUTION_MAX_CALLS)
       return socket.terminate();
+    const { operation, id } = message;
+    if (reset) {
+      send({ kind: "error", id, code: "worker_restarting" });
+      return;
+    }
+    if (operation.kind === "restartRuntime") {
+      if (!negotiateRestart || !admitted.restartRuntime) {
+        send({ kind: "error", id, code: "worker_restart_unsupported" });
+        return;
+      }
+      const restart = admitted.restartRuntime.bind(admitted);
+      reset = Promise.allSettled(inflight.values()).then(() =>
+        lifetime.signal.aborted ? undefined : restart(operation.keepTerminals),
+      );
+      void reset.then(
+        () => send({ kind: "result", id, value: null }),
+        () => send({ kind: "error", id, code: "worker_restart_unconfirmed" }),
+      );
+      return;
+    }
     const task = admitted
-      .execute(message.operation)
+      .execute(operation)
       .then(
         (value) => send({ kind: "result", id: message.id, value }),
         (error: unknown) => {
@@ -193,7 +227,11 @@ async function handleChannel(
   });
   await closed;
   try {
-    if (runtime) await (await runtime).close();
+    try {
+      await reset;
+    } finally {
+      if (runtime) await (await runtime).close();
+    }
   } finally {
     await Promise.allSettled(inflight.values());
   }

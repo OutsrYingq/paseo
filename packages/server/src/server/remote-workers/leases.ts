@@ -1,6 +1,7 @@
-﻿import { z } from "zod";
 import { DaemonPermissionSchema } from "@getpaseo/protocol/messages";
+import { z } from "zod";
 import { parseWorkerAuthority } from "./authority.js";
+import { WorkerOperationError } from "./execution-protocol.js";
 
 export const WorkerBindingSchema = z.strictObject({
   workerId: z.string().min(1),
@@ -104,6 +105,8 @@ class ActiveTarget implements ActiveWorkerTarget {
   readonly abort = new AbortController();
   readonly signal = this.abort.signal;
   readonly sessions = new Map<string, ActiveGrant>();
+  maintenanceUntil = 0;
+  maintenanceTimer?: NodeJS.Timeout;
   constructor(readonly target: WorkerTarget) {}
 }
 
@@ -134,7 +137,13 @@ export class WorkerLeases {
   private readonly shutdown = new AbortController();
   private readonly admissionByHost = new Map<string, Promise<unknown>>();
 
-  constructor(private readonly authority: WorkerAuthority) {}
+  constructor(
+    private readonly authority: WorkerAuthority,
+    private readonly verifyReplacement?: (
+      candidate: ActiveWorkerTarget,
+      signal: AbortSignal,
+    ) => Promise<void>,
+  ) {}
 
   admit(hostname: string, credential: WorkerCredential) {
     const previous = this.admissionByHost.get(hostname) ?? Promise.resolve();
@@ -146,6 +155,113 @@ export class WorkerLeases {
       })
       .catch(() => undefined);
     return admitted;
+  }
+
+  async runMaintenance<T>(
+    grant: WorkerGrant,
+    request: AbortSignal,
+    operation: (target: ActiveWorkerTarget, signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    request.throwIfAborted();
+    const remaining = grant.expiresAt - Date.now();
+    if (remaining <= 0) throw new WorkerOperationError("worker_maintenance_expired");
+    if (this.shutdown.signal.aborted) throw new WorkerOperationError("worker_unavailable");
+    const target = await this.acquireMaintenanceTarget(grant.target, request, grant.expiresAt);
+    if (!target) throw new WorkerOperationError("worker_maintenance_stale_target");
+    // Keep the shared scope warm across a grant's requests, without joining or renewing a public lease.
+    if (grant.expiresAt > target.maintenanceUntil) {
+      target.maintenanceUntil = grant.expiresAt;
+      this.scheduleMaintenanceExpiry(target);
+    }
+    return callAuthority(
+      AbortSignal.any([target.signal, request]),
+      Math.min(grant.expiresAt - Date.now(), 2_147_483_647),
+      (signal) => operation(target, signal),
+    );
+  }
+
+  private async acquireMaintenanceTarget(
+    target: WorkerTarget,
+    request: AbortSignal,
+    expiresAt: number,
+  ) {
+    const known = this.targets.get(target.workerId);
+    if (!known || known.target.podUid === target.podUid) return this.acquireTarget(target);
+    const previous = known.target;
+    if (!this.verifyReplacement || !this.isEligibleTarget(known, target)) return;
+    const verify = this.verifyReplacement;
+    const candidate = new ActiveTarget(target);
+    let adopted = false;
+    try {
+      await callAuthority(
+        AbortSignal.any([this.shutdown.signal, request]),
+        Math.min(expiresAt - Date.now(), 10_000),
+        (signal) => verify(candidate, signal),
+      );
+      if (
+        request.aborted ||
+        this.shutdown.signal.aborted ||
+        Date.now() >= expiresAt ||
+        known.target !== previous
+      )
+        return;
+      this.replaceTarget(known, candidate);
+      adopted = true;
+      return candidate;
+    } finally {
+      if (!adopted) candidate.abort.abort();
+    }
+  }
+
+  private isEligibleTarget(known: KnownTarget, target: WorkerTarget): boolean {
+    return (
+      !known.revokedPods.has(target.podUid) &&
+      known.target.serverId === target.serverId &&
+      !(
+        target.revision !== undefined &&
+        known.target.revision !== undefined &&
+        target.revision < known.target.revision
+      )
+    );
+  }
+
+  private replaceTarget(known: KnownTarget, next: ActiveTarget): void {
+    known.revokedPods.add(known.target.podUid);
+    if (known.active) this.dropTarget(known.active);
+    known.target = next.target;
+    known.active = next;
+  }
+
+  private acquireTarget(target: WorkerTarget): ActiveTarget | undefined {
+    let known = this.targets.get(target.workerId);
+    if (!known) {
+      known = { target, revokedPods: new Set() };
+      this.targets.set(target.workerId, known);
+    }
+    if (!this.isEligibleTarget(known, target)) return;
+    if (known.target.podUid !== target.podUid) {
+      this.replaceTarget(known, new ActiveTarget(target));
+    } else {
+      if (!sameTarget(known.target, target)) return;
+      if (target.revision !== undefined && target.revision !== known.target.revision) {
+        known.target = target;
+      }
+    }
+    return (known.active ??= new ActiveTarget(target));
+  }
+
+  private scheduleMaintenanceExpiry(target: ActiveTarget): void {
+    clearTimeout(target.maintenanceTimer);
+    const remaining = target.maintenanceUntil - Date.now();
+    if (remaining <= 0) {
+      if (target.sessions.size === 0) this.dropTarget(target);
+      return;
+    }
+    target.maintenanceTimer = setTimeout(
+      () => this.scheduleMaintenanceExpiry(target),
+      Math.min(remaining, 2_147_483_647),
+    );
+    target.maintenanceTimer.unref();
   }
 
   private async admitCurrent(
@@ -164,23 +280,8 @@ export class WorkerLeases {
       const grant = WorkerGrantSchema.parse(result.grant);
       if (grant.hostname !== hostname || grant.expiresAt <= Date.now())
         return { kind: "unavailable" };
-      const { target } = grant;
-      let known = this.targets.get(target.workerId);
-      if (!known) {
-        known = { target, revokedPods: new Set() };
-        this.targets.set(target.workerId, known);
-      }
-      if (known.revokedPods.has(target.podUid) || known.target.serverId !== target.serverId) {
-        return { kind: "unavailable" };
-      }
-      if (known.target.podUid !== target.podUid) {
-        known.revokedPods.add(known.target.podUid);
-        if (known.active) this.dropTarget(known.active);
-        known.target = target;
-      } else if (!sameTarget(known.target, target)) {
-        return { kind: "unavailable" };
-      }
-      const execution = (known.active ??= new ActiveTarget(target));
+      const execution = this.acquireTarget(grant.target);
+      if (!execution) return { kind: "unavailable" };
       const existing = execution.sessions.get(grant.leaseId);
       if (existing) {
         if (
@@ -272,10 +373,13 @@ export class WorkerLeases {
     lease.abort.abort();
     const { execution } = lease;
     execution.sessions.delete(lease.grant.leaseId);
-    if (execution.sessions.size === 0) this.dropTarget(execution);
+    if (execution.sessions.size === 0 && execution.maintenanceUntil <= Date.now()) {
+      this.dropTarget(execution);
+    }
   }
 
   private dropTarget(execution: ActiveTarget): void {
+    clearTimeout(execution.maintenanceTimer);
     execution.abort.abort();
     for (const lease of execution.sessions.values()) {
       clearTimeout(lease.timer);

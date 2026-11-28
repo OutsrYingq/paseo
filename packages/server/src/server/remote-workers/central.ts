@@ -2,7 +2,7 @@ import { ProviderCatalogSession } from "../session/provider/provider-catalog-ses
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import WebSocket, { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import type { Logger } from "pino";
 import { decodePluginFrame, PluginFrameOpcode } from "@getpaseo/protocol/binary-frames/index";
 import { PluginAgentClientRegistry } from "../agent/plugin-provider.js";
@@ -17,6 +17,14 @@ import {
 import { extractHttpBearerToken, extractWsBearerProtocol, extractWsBearerToken } from "../auth.js";
 import { OWNER_PERMISSIONS, SessionAuthorization } from "../authorization/index.js";
 import { isDaemonOriginAllowed } from "../websocket-server.js";
+import {
+  dispatchMaintenance,
+  readWorkerAgent,
+  refreshWorkerAgent,
+  parseMaintenance,
+  type WorkerMaintenanceOperation,
+  type WorkerMaintenanceResult,
+} from "./central-maintenance.js";
 import { workerHost } from "./authority.js";
 import { openCentralAgents, type CentralTimelineUpdate } from "./central-agents.js";
 import { decodeJson, WorkerOperationError } from "./execution-protocol.js";
@@ -24,6 +32,7 @@ import {
   WorkerLeases,
   type ActiveWorkerTarget,
   type WorkerAuthority,
+  type WorkerGrant,
   type WorkerLease,
 } from "./leases.js";
 import { RemoteProviderProcesses } from "./remote-provider-processes.js";
@@ -58,9 +67,17 @@ type TimelineSubscriptions = Map<string, ReadonlySet<string>>;
 type Delivery = (event: CentralTimelineUpdate | typeof connectionLostEvent) => void;
 
 export async function startRemoteCentral(options: CentralOptions) {
-  const leases = new WorkerLeases(options.authority);
+  const verifiedConnections = new WeakMap<ActiveWorkerTarget, WorkerConnection>();
+  const leases = new WorkerLeases(options.authority, async (candidate) => {
+    // AP's per-worker Service has one live writer. Binding verifies that the signed candidate still serves it.
+    const connection = new WorkerConnection(candidate, options.workerTls);
+    await connection.ready();
+    verifiedConnections.set(candidate, connection);
+  });
   const downloads = new RemoteDownloads();
   const scopeByTarget = new Map<ActiveWorkerTarget, Promise<WorkerScope>>();
+  const restarting = new Set<ActiveWorkerTarget>();
+  const operations = new Map<ActiveWorkerTarget, Set<Promise<unknown>>>();
   const audiences = new Map<ActiveWorkerTarget, Set<Delivery>>();
   const upgrades = new WebSocketServer({
     noServer: true,
@@ -72,13 +89,34 @@ export async function startRemoteCentral(options: CentralOptions) {
   const allowedOrigins = new Set(options.allowedOrigins);
   let closing = false;
 
+  async function runOperation<T>(
+    execution: ActiveWorkerTarget,
+    action: () => Promise<T>,
+  ): Promise<T> {
+    if (restarting.has(execution)) throw new WorkerOperationError("worker_restarting");
+    const pending = operations.get(execution) ?? new Set<Promise<unknown>>();
+    const task = action();
+    pending.add(task);
+    operations.set(execution, pending);
+    try {
+      return await task;
+    } finally {
+      pending.delete(task);
+      if (!pending.size) operations.delete(execution);
+    }
+  }
+
   function scopeFor(execution: ActiveWorkerTarget): Promise<WorkerScope> {
+    if (restarting.has(execution)) throw new WorkerOperationError("worker_restarting");
     const current = scopeByTarget.get(execution);
     if (current) return current;
     let providers: RemoteProviderProcesses;
     let terminals: RemoteTerminalManager;
     let plugins: RemotePluginClient;
-    const connection = new WorkerConnection(execution, options.workerTls, (event) => {
+    const connection =
+      verifiedConnections.get(execution) ?? new WorkerConnection(execution, options.workerTls);
+    verifiedConnections.delete(execution);
+    connection.setEventHandler((event) => {
       if ("processId" in event) providers.onEvent(event);
       else if (event.type === "plugin") plugins.onEvent(event);
       else terminals.handleEvent(event);
@@ -145,7 +183,7 @@ export async function startRemoteCentral(options: CentralOptions) {
         if (connection.signal.aborted) return;
         value.catalog.replacePluginProviders(registrations);
         pluginProviders.replace(registrations);
-        value.setPluginClients(pluginProviders.clients());
+        return value.setPluginClients(pluginProviders.clients());
       });
       refreshTail = next.catch((error) =>
         logger.warn({ err: error }, "Worker plugin providers unavailable"),
@@ -186,6 +224,15 @@ export async function startRemoteCentral(options: CentralOptions) {
     res.end(JSON.stringify(body));
   }
 
+  async function download(request: IncomingMessage, response: ServerResponse, hostname: string) {
+    const query = new URLSearchParams(request.url?.split("?")[1]);
+    const tokens = query.getAll("token");
+    if (tokens.length !== 1 || !tokens[0])
+      return json(response, 400, { error: "Missing download token" });
+    if (!(await downloads.consume(hostname, tokens[0], response)))
+      return json(response, 403, { error: "Invalid or expired token" });
+  }
+
   async function http(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const hostname = workerHost(request);
     if (!hostname) return json(response, 400, { error: "Invalid Host" });
@@ -198,15 +245,8 @@ export async function startRemoteCentral(options: CentralOptions) {
       response.setHeader("vary", "Origin");
     }
     const route = request.url?.split("?", 1)[0];
-    if (request.method === "GET" && route === "/api/files/download") {
-      const query = new URLSearchParams(request.url?.split("?")[1]);
-      const tokens = query.getAll("token");
-      if (tokens.length !== 1 || !tokens[0])
-        return json(response, 400, { error: "Missing download token" });
-      if (!(await downloads.consume(hostname, tokens[0], response)))
-        return json(response, 403, { error: "Invalid or expired token" });
-      return;
-    }
+    if (request.method === "GET" && route === "/api/files/download")
+      return download(request, response, hostname);
     const token = extractHttpBearerToken(request.headers.authorization);
     const admitted = await leases.admit(
       hostname,
@@ -293,7 +333,7 @@ export async function startRemoteCentral(options: CentralOptions) {
       }
     });
 
-    async function hello(message: WSHelloMessage): Promise<void> {
+    async function admitHello(message: WSHelloMessage): Promise<WorkerLease | undefined> {
       if (message.protocolVersion !== 1) {
         send({
           type: "hello.rejected",
@@ -309,14 +349,23 @@ export async function startRemoteCentral(options: CentralOptions) {
         password === null ? { kind: "none" } : { kind: "password", password },
       );
       if (admitted.kind !== "allowed") {
-        if (admitted.kind !== "unauthorized") return socket.close(1013, "Worker unavailable");
+        if (admitted.kind !== "unauthorized") {
+          socket.close(1013, "Worker unavailable");
+          return;
+        }
         const reason = password === null ? "password_required" : "incorrect_password";
         if (token === null && (message.auth || message.capabilities?.hello_rejection)) {
           send({ type: "hello.rejected", reason, accepts: ["password"] });
         }
-        return socket.close(4401, password === null ? "Password required" : "Incorrect password");
+        socket.close(4401, password === null ? "Password required" : "Incorrect password");
+        return;
       }
-      const lease = admitted.lease;
+      return admitted.lease;
+    }
+
+    async function hello(message: WSHelloMessage): Promise<void> {
+      const lease = await admitHello(message);
+      if (!lease) return;
       const granted = lease.grant.scope === "owner" ? OWNER_PERMISSIONS : lease.grant.scope;
       const requested = message.sessionPermissions;
       const authorization = new SessionAuthorization(
@@ -354,7 +403,7 @@ export async function startRemoteCentral(options: CentralOptions) {
         client: scope.plugins,
         signal: lease.signal,
         send: sendAuthorized,
-        canReceive: (message) => !lease.signal.aborted && authorization.allowsOutbound(message),
+        canReceive: (outbound) => !lease.signal.aborted && authorization.allowsOutbound(outbound),
         supportsBinary: message.capabilities?.[CLIENT_CAPS.pluginBinaryPayloads] === true,
         sendBinary(bytes) {
           if (
@@ -379,7 +428,9 @@ export async function startRemoteCentral(options: CentralOptions) {
           });
           return;
         }
-        if (authorization.allowsPermission("workspace.write")) terminalSession.handleBinary(bytes);
+        if (!restarting.has(lease.execution) && authorization.allowsPermission("workspace.write")) {
+          terminalSession.handleBinary(bytes);
+        }
       };
       const subscriptions: TimelineSubscriptions = new Map();
       const eventSubscriptions = new Map<string, Set<string>>();
@@ -456,7 +507,56 @@ export async function startRemoteCentral(options: CentralOptions) {
         audience.delete(deliver);
         if (audience.size === 0) audiences.delete(lease.execution);
       };
-      handle = async (operation) => {
+      async function subscribeCreation(
+        operation: Extract<SessionInboundMessage, { type: "creation.subscribe.request" }>,
+      ) {
+        if (creationSubscriptions.size >= 64)
+          throw new WorkerOperationError("worker_subscription_limit");
+        const subscriptionId = operation.subscribe === false ? undefined : randomUUID();
+        const updates: Array<
+          Extract<
+            SessionOutboundMessage,
+            { type: "agent.create.update" | "workspace.create.update" }
+          >
+        > = [];
+        let attached = false;
+        const observed = await scope.observeCreation(
+          operation.kind,
+          operation.idempotencyKey,
+          (snapshot) => {
+            if (!subscriptionId || sessionClosed) return;
+            const update = {
+              type:
+                snapshot.kind === "agent"
+                  ? ("agent.create.update" as const)
+                  : ("workspace.create.update" as const),
+              payload: { ...snapshot, subscriptionId },
+            };
+            if (attached) sendAuthorized(update);
+            else updates.push(update);
+          },
+        );
+        if (sessionClosed || !subscriptionId) observed.unsubscribe();
+        else creationSubscriptions.set(subscriptionId, observed.unsubscribe);
+        sendAuthorized({
+          type: "creation.subscribe.response",
+          payload: {
+            requestId: operation.requestId,
+            subscriptionId,
+            snapshot: observed.snapshot,
+            error: null,
+          },
+        });
+        attached = true;
+        for (const update of updates) sendAuthorized(update);
+      }
+
+      const timelineProjection = {
+        reasoningMerge: message.capabilities?.[CLIENT_CAPS.reasoningMergeEnum] === true,
+        notification: message.capabilities?.[CLIENT_CAPS.timelineNotifications] === true,
+        plugin: message.capabilities?.[CLIENT_CAPS.pluginTimelineItems] === true,
+      };
+      const handleOperation = async (operation: SessionInboundMessage) => {
         if (!authorization.allowsInbound(operation)) {
           if ("requestId" in operation && typeof operation.requestId === "string")
             sendSession({
@@ -517,48 +617,7 @@ export async function startRemoteCentral(options: CentralOptions) {
           });
           return;
         }
-        if (operation.type === "creation.subscribe.request") {
-          if (creationSubscriptions.size >= 64)
-            throw new WorkerOperationError("worker_subscription_limit");
-          const subscriptionId = operation.subscribe === false ? undefined : randomUUID();
-          const updates: Array<
-            Extract<
-              SessionOutboundMessage,
-              { type: "agent.create.update" | "workspace.create.update" }
-            >
-          > = [];
-          let attached = false;
-          const observed = await scope.observeCreation(
-            operation.kind,
-            operation.idempotencyKey,
-            (snapshot) => {
-              if (!subscriptionId || sessionClosed) return;
-              const update = {
-                type:
-                  snapshot.kind === "agent"
-                    ? ("agent.create.update" as const)
-                    : ("workspace.create.update" as const),
-                payload: { ...snapshot, subscriptionId },
-              };
-              if (attached) sendAuthorized(update);
-              else updates.push(update);
-            },
-          );
-          if (sessionClosed || !subscriptionId) observed.unsubscribe();
-          else creationSubscriptions.set(subscriptionId, observed.unsubscribe);
-          sendAuthorized({
-            type: "creation.subscribe.response",
-            payload: {
-              requestId: operation.requestId,
-              subscriptionId,
-              snapshot: observed.snapshot,
-              error: null,
-            },
-          });
-          attached = true;
-          for (const update of updates) sendAuthorized(update);
-          return;
-        }
+        if (operation.type === "creation.subscribe.request") return subscribeCreation(operation);
         const catalog = catalogSession.dispatch(operation);
         if (catalog) return catalog;
         if (terminalSession.handles(operation)) return terminalSession.dispatch(operation);
@@ -569,13 +628,82 @@ export async function startRemoteCentral(options: CentralOptions) {
           operation,
           subscriptions,
           downloads,
-          {
-            reasoningMerge: message.capabilities?.[CLIENT_CAPS.reasoningMergeEnum] === true,
-            notification: message.capabilities?.[CLIENT_CAPS.timelineNotifications] === true,
-            plugin: message.capabilities?.[CLIENT_CAPS.pluginTimelineItems] === true,
-          },
+          timelineProjection,
           sendAuthorized,
         );
+      };
+      handle = async (operation) => {
+        if (
+          operation.type !== "restart_server_request" ||
+          !authorization.allowsInbound(operation)
+        ) {
+          // A finish observer can wait on an agent that this restart will close.
+          if (operation.type === "wait_for_finish_request" && !restarting.has(lease.execution)) {
+            return handleOperation(operation);
+          }
+          return runOperation(lease.execution, () => handleOperation(operation));
+        }
+        const { requestId, reason } = operation;
+        const fail = (code: string) =>
+          sendAuthorized({
+            type: "rpc_error",
+            payload: { requestId, requestType: operation.type, code, error: code },
+          });
+        if (!scope.connection.supportsRuntimeRestart) return fail("worker_restart_unsupported");
+        if (restarting.has(lease.execution)) {
+          return fail("worker_restart_busy");
+        }
+        if (
+          lease.signal.aborted ||
+          lease.grant.expiresAt <= Date.now() ||
+          scope.connection.signal.aborted
+        ) {
+          return fail("worker_restart_stale_target");
+        }
+        restarting.add(lease.execution);
+        const deadline = AbortSignal.timeout(15_000);
+        const signal = AbortSignal.any([deadline, scope.connection.signal, lease.signal]);
+        const abandon = () => {
+          if (deadline.aborted && !scope.connection.signal.aborted)
+            fail("worker_restart_unconfirmed");
+          scope.connection.close();
+        };
+        signal.addEventListener("abort", abandon, { once: true });
+        try {
+          await Promise.allSettled(operations.get(lease.execution) ?? []);
+          signal.throwIfAborted();
+          await scope.close();
+          signal.throwIfAborted();
+          if (lease.grant.expiresAt <= Date.now()) return;
+          await scope.connection.call({
+            kind: "restartRuntime",
+            keepTerminals: operation.killTerminals !== true,
+          });
+          signal.throwIfAborted();
+          if (lease.grant.expiresAt <= Date.now()) return;
+          sendAuthorized({
+            type: "status",
+            payload: {
+              status: "restart_requested",
+              clientId: message.clientId,
+              requestId,
+              ...(reason?.trim() ? { reason } : {}),
+            },
+          });
+        } catch {
+          if (!signal.aborted) fail("worker_restart_unconfirmed");
+        } finally {
+          signal.removeEventListener("abort", abandon);
+          if (scope.connection.signal.aborted) restarting.delete(lease.execution);
+          else {
+            scope.connection.signal.addEventListener(
+              "abort",
+              () => restarting.delete(lease.execution),
+              { once: true },
+            );
+            scope.connection.close();
+          }
+        }
       };
       sendSession({
         type: "status",
@@ -591,6 +719,10 @@ export async function startRemoteCentral(options: CentralOptions) {
             creationLifecycle: true,
             workspaceMultiplicity: true,
             workspaceTerminals: true,
+            ...(scope.connection.supportsRuntimeRestart &&
+            authorization.allowsPermission("daemon.manage")
+              ? { terminalsSurviveRestart: true }
+              : {}),
             providersSnapshot: true,
             plugins: true,
             pluginManagement: true,
@@ -642,6 +774,36 @@ export async function startRemoteCentral(options: CentralOptions) {
   );
   return {
     port: (server.address() as AddressInfo).port,
+    /** The embedding adapter must authenticate and bind the grant before calling. */
+    async maintenance<Operation extends WorkerMaintenanceOperation>(
+      grant: WorkerGrant,
+      operation: Operation,
+      signal: AbortSignal,
+    ): Promise<WorkerMaintenanceResult[Operation["type"]]> {
+      const input = parseMaintenance(grant, operation);
+      try {
+        return await leases.runMaintenance(input.grant, signal, (target, deadline) =>
+          runOperation(target, async () => {
+            const scope = await scopeFor(target);
+            const active = AbortSignal.any([scope.connection.signal, deadline]);
+            active.throwIfAborted();
+            const response = await dispatchMaintenance(
+              scope,
+              input.operation,
+              active,
+              options.logger,
+            );
+            active.throwIfAborted();
+            return response.payload as WorkerMaintenanceResult[Operation["type"]];
+          }),
+        );
+      } catch (error) {
+        if (error instanceof WorkerOperationError && error.message !== "worker_connection_lost") {
+          throw error;
+        }
+        throw new WorkerOperationError("worker_maintenance_unconfirmed", { cause: error });
+      }
+    },
     async close() {
       closing = true;
       const opened = [...scopeByTarget.values()];
@@ -668,53 +830,128 @@ async function dispatch(
   const reply = (response: SessionOutboundMessage) => {
     if (!lease.signal.aborted) send(response);
   };
-  const errorCode = (error: unknown) =>
-    error instanceof WorkerOperationError ? error.message : "worker_operation_failed";
   switch (message.type) {
-    case "agent.timeline.set_subscription.request": {
-      if (subscriptions.size >= 64) throw new WorkerOperationError("worker_subscription_limit");
-      const agentIds = [...new Set(message.agentIds)].sort();
-      const subscriptionId = randomUUID();
-      subscriptions.set(subscriptionId, new Set(agentIds));
-      const timelines: Record<string, "current" | "behind"> = {};
-      const agents: Record<
-        string,
-        NonNullable<Awaited<ReturnType<WorkerScope["readSnapshot"]>>>
-      > = {};
-      if (message.cursors) {
-        for (const agentId of agentIds) {
-          const expected = message.cursors[agentId];
-          const actual = scope.timelineHead(agentId);
-          timelines[agentId] = "behind";
-          if (expected && actual?.epoch === expected.epoch && actual.seq === expected.seq) {
-            const agent = await scope.readSnapshot(agentId);
-            if (agent) {
-              agents[agentId] = agent;
-              timelines[agentId] = "current";
-            }
-          }
-        }
-      }
+    case "agent.timeline.set_subscription.request":
+      return subscribeTimelines(scope, message, subscriptions, reply);
+    case "fetch_agent_request":
+    case "refresh_agent_request":
+    case "fetch_agent_timeline_request":
+    case "cancel_agent_request":
+    case "archive_agent_request":
+    case "wait_for_finish_request":
+      return dispatchAgent(scope, lease, message, timelineProjection, reply);
+    case "file_explorer_request":
+    case "file_download_token_request":
+      return dispatchFiles(scope, lease, message, downloads, reply);
+    case "agent.create.request":
+    case "create_agent_request":
+    case "send_agent_message_request":
+    case "workspace.create.request":
+      return dispatchCreation(scope, lease, message, reply);
+    case "ping": {
+      const now = Date.now();
       reply({
-        type: "agent.timeline.set_subscription.response",
+        type: "pong",
         payload: {
           requestId: message.requestId,
-          agentIds,
-          subscriptionId,
-          ...(message.cursors ? { timelines, agents } : {}),
+          clientSentAt: message.clientSentAt,
+          serverReceivedAt: now,
+          serverSentAt: now,
         },
       });
       break;
     }
+    default:
+      if ("requestId" in message && typeof message.requestId === "string") {
+        reply({
+          type: "rpc_error",
+          payload: {
+            requestId: message.requestId,
+            error: "worker_operation_unsupported",
+          },
+        });
+      }
+  }
+}
+
+function errorCode(error: unknown) {
+  return error instanceof WorkerOperationError ? error.message : "worker_operation_failed";
+}
+
+async function subscribeTimelines(
+  scope: WorkerScope,
+  message: Extract<SessionInboundMessage, { type: "agent.timeline.set_subscription.request" }>,
+  subscriptions: TimelineSubscriptions,
+  reply: (response: SessionOutboundMessage) => void,
+) {
+  if (subscriptions.size >= 64) throw new WorkerOperationError("worker_subscription_limit");
+  const agentIds = [...new Set(message.agentIds)].sort();
+  const subscriptionId = randomUUID();
+  subscriptions.set(subscriptionId, new Set(agentIds));
+  const timelines: Record<string, "current" | "behind"> = {};
+  const agents: Record<string, NonNullable<Awaited<ReturnType<WorkerScope["readSnapshot"]>>>> = {};
+  if (message.cursors) {
+    for (const agentId of agentIds) {
+      const expected = message.cursors[agentId];
+      const actual = scope.timelineHead(agentId);
+      timelines[agentId] = "behind";
+      if (!expected || actual?.epoch !== expected.epoch || actual.seq !== expected.seq) continue;
+      const agent = await scope.readSnapshot(agentId);
+      if (agent) {
+        agents[agentId] = agent;
+        timelines[agentId] = "current";
+      }
+    }
+  }
+  reply({
+    type: "agent.timeline.set_subscription.response",
+    payload: {
+      requestId: message.requestId,
+      agentIds,
+      subscriptionId,
+      ...(message.cursors ? { timelines, agents } : {}),
+    },
+  });
+}
+
+async function dispatchAgent(
+  scope: WorkerScope,
+  lease: WorkerLease,
+  message: Extract<
+    SessionInboundMessage,
+    {
+      type:
+        | "fetch_agent_request"
+        | "refresh_agent_request"
+        | "fetch_agent_timeline_request"
+        | "cancel_agent_request"
+        | "archive_agent_request"
+        | "wait_for_finish_request";
+    }
+  >,
+  timelineProjection: Parameters<WorkerScope["fetchTimeline"]>[1],
+  reply: (response: SessionOutboundMessage) => void,
+) {
+  switch (message.type) {
     case "fetch_agent_request": {
-      const agent = await scope.readSnapshot(message.agentId);
-      const project = agent?.workspaceId
-        ? await scope.directory.projectForWorkspace(agent.workspaceId)
-        : null;
-      reply({
-        type: "fetch_agent_response",
-        payload: { requestId: message.requestId, agent, project, error: null },
-      });
+      reply(await readWorkerAgent(scope, message));
+      break;
+    }
+    case "refresh_agent_request": {
+      try {
+        reply(await refreshWorkerAgent(scope, message, lease.signal));
+      } catch (error) {
+        if (lease.signal.aborted || scope.connection.signal.aborted) return;
+        reply({
+          type: "rpc_error",
+          payload: {
+            requestId: message.requestId,
+            requestType: message.type,
+            code: "agent_refresh_failed",
+            error: error instanceof Error ? error.message : "Agent refresh failed",
+          },
+        });
+      }
       break;
     }
     case "fetch_agent_timeline_request": {
@@ -769,6 +1006,20 @@ async function dispatch(
       });
       break;
     }
+  }
+}
+
+async function dispatchFiles(
+  scope: WorkerScope,
+  lease: WorkerLease,
+  message: Extract<
+    SessionInboundMessage,
+    { type: "file_explorer_request" | "file_download_token_request" }
+  >,
+  downloads: RemoteDownloads,
+  reply: (response: SessionOutboundMessage) => void,
+) {
+  switch (message.type) {
     case "file_explorer_request": {
       const { cwd, requestId, mode } = message;
       const path = message.path || ".";
@@ -817,6 +1068,25 @@ async function dispatch(
       }
       break;
     }
+  }
+}
+
+async function dispatchCreation(
+  scope: WorkerScope,
+  lease: WorkerLease,
+  message: Extract<
+    SessionInboundMessage,
+    {
+      type:
+        | "agent.create.request"
+        | "create_agent_request"
+        | "send_agent_message_request"
+        | "workspace.create.request";
+    }
+  >,
+  reply: (response: SessionOutboundMessage) => void,
+) {
+  switch (message.type) {
     case "agent.create.request": {
       try {
         const creation = await scope.createAgent(message, lease.signal);
@@ -932,28 +1202,5 @@ async function dispatch(
       }
       break;
     }
-    case "ping": {
-      const now = Date.now();
-      reply({
-        type: "pong",
-        payload: {
-          requestId: message.requestId,
-          clientSentAt: message.clientSentAt,
-          serverReceivedAt: now,
-          serverSentAt: now,
-        },
-      });
-      break;
-    }
-    default:
-      if ("requestId" in message && typeof message.requestId === "string") {
-        reply({
-          type: "rpc_error",
-          payload: {
-            requestId: message.requestId,
-            error: "worker_operation_unsupported",
-          },
-        });
-      }
   }
 }

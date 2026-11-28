@@ -1,11 +1,16 @@
-﻿export { startRemoteCentral, type CentralOptions } from "./central.js";
+export {
+  WorkerMaintenanceOperationSchema,
+  type WorkerMaintenanceOperation,
+  type WorkerMaintenanceResult,
+} from "./central-maintenance.js";
+export { startRemoteCentral, type CentralOptions } from "./central.js";
 export {
   startResidentExecution,
   type ResidentExecutionOptions,
   type ResidentRuntime,
 } from "./resident-execution.js";
 export { createNativeExecution, type NativeExecutionOptions } from "./native-execution.js";
-export { EXECUTION_PATH, EXECUTION_PROTOCOL } from "./execution-protocol.js";
+export { EXECUTION_PATH, EXECUTION_PROTOCOL, WorkerOperationError } from "./execution-protocol.js";
 export {
   WorkerBindingSchema,
   WorkerTargetSchema,

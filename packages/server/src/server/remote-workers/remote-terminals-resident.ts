@@ -63,6 +63,16 @@ export function createResidentTerminals(options: ResidentTerminalOptions = {}) {
     return [...terminalsByCwd.values()].flat();
   }
 
+  async function killAll(): Promise<void> {
+    await Promise.allSettled(starting.values());
+    await Promise.all([
+      ...stopping.values(),
+      ...terminalIds()
+        .filter((id) => !stopping.has(id))
+        .map((id) => manager.killTerminalAndWait(id)),
+    ]);
+  }
+
   const unsubscribeRevision = manager.subscribeTerminalsChanged(({ cwd, terminals }) => {
     if (terminals.length)
       terminalsByCwd.set(
@@ -76,6 +86,7 @@ export function createResidentTerminals(options: ResidentTerminalOptions = {}) {
 
   return {
     registerCwdEnv: manager.registerCwdEnv,
+    killAll,
     open(publish: (event: RemoteTerminalEvent) => void, signal: AbortSignal) {
       signal.throwIfAborted();
       if (disposal) throw error("terminal_resident_stopped");
@@ -297,14 +308,8 @@ export function createResidentTerminals(options: ResidentTerminalOptions = {}) {
       disposal ??= (async () => {
         releaseChannel?.();
 
-        await Promise.allSettled(starting.values());
         try {
-          await Promise.all([
-            ...stopping.values(),
-            ...terminalIds()
-              .filter((id) => !stopping.has(id))
-              .map((id) => manager.killTerminalAndWait(id)),
-          ]);
+          await killAll();
         } finally {
           unsubscribeRevision();
         }

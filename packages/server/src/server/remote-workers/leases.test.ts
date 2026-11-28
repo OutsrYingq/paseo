@@ -1,4 +1,5 @@
-﻿import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
 import { workerHost } from "./authority.js";
 import { NativeTurnOwnership } from "./native-turn-ownership.js";
 import { WorkerLeases, type WorkerAuthority, type WorkerGrant } from "./leases.js";
@@ -16,7 +17,7 @@ function grant(podUid: string, leaseId: string, lifetime = 100): WorkerGrant {
       podUid,
       revision: 5,
       endpoint: "wss://localhost/execute",
-      certFingerprint256: new Array(32).fill("AA").join(":"),
+      certFingerprint256: "AA:".repeat(31) + "AA",
     },
   };
 }
@@ -168,6 +169,115 @@ describe("remote worker authority", () => {
     } finally {
       registry.close();
       vi.useRealTimers();
+    }
+  });
+
+  it("shares maintenance with public admission and fences it on Pod replacement", async () => {
+    let current = grant("same", "public", 60_000);
+    const admit = vi.fn(async () => allowed(current));
+    const registry = new WorkerLeases({ admit, renew: async (previous) => allowed(previous) });
+    const controls = new AbortController();
+    const maintenanceReady = Promise.withResolvers<void>();
+    const blocked = Promise.withResolvers<void>();
+    try {
+      const admission = await registry.admit(hostname, credential);
+      if (admission.kind !== "allowed") throw new Error("initial admission failed");
+      const maintenance = registry.runMaintenance(
+        { ...current, scope: ["workspace.read"], leaseId: "maintenance" },
+        controls.signal,
+        async (target) => {
+          expect(target).toBe(admission.lease.execution);
+          maintenanceReady.resolve();
+          await blocked.promise;
+        },
+      );
+      const rejected = expect(maintenance).rejects.toThrow();
+      await maintenanceReady.promise;
+      expect(admit).toHaveBeenCalledTimes(1);
+      const next = grant("next", "public-next", 60_000);
+      await expect(registry.runMaintenance(next, controls.signal, async () => {})).rejects.toThrow(
+        "worker_maintenance_stale_target",
+      );
+      expect(admission.lease.signal.aborted).toBe(false);
+      current = next;
+      expect((await registry.admit(hostname, credential)).kind).toBe("allowed");
+      await rejected;
+      expect(admission.lease.signal.aborted).toBe(true);
+    } finally {
+      blocked.resolve();
+      registry.close();
+    }
+  });
+
+  it("reuses a proven same-revision replacement and rejects stale replay before probing", async () => {
+    const old = grant("old", "session", 60_000);
+    const next = grant("next", "maintenance", 60_000);
+    const staleCandidate = grant("unreachable", "maintenance-old", 60_000);
+    const verify = vi.fn(async (target: { target: WorkerGrant["target"] }) => {
+      if (target.target.podUid === staleCandidate.target.podUid) throw new Error("bind failed");
+    });
+    const registry = new WorkerLeases(
+      {
+        admit: async () => allowed(old),
+        renew: async (previous) => allowed(previous),
+      },
+      verify,
+    );
+    const signal = new AbortController().signal;
+    try {
+      const admission = await registry.admit(hostname, credential);
+      if (admission.kind !== "allowed") throw new Error("initial admission failed");
+      await expect(registry.runMaintenance(staleCandidate, signal, async () => {})).rejects.toThrow(
+        "bind failed",
+      );
+      expect(admission.lease.signal.aborted).toBe(false);
+      const verified = await registry.runMaintenance(next, signal, async (target) => target);
+      expect(admission.lease.signal.aborted).toBe(true);
+      expect(await registry.runMaintenance(next, signal, async (target) => target)).toBe(verified);
+      await expect(registry.runMaintenance(old, signal, async () => {})).rejects.toThrow(
+        "worker_maintenance_stale_target",
+      );
+      expect(verify).toHaveBeenCalledTimes(2);
+    } finally {
+      registry.close();
+    }
+  });
+
+  it("discards a completed probe when another admission already changed the target", async () => {
+    let current = grant("old", "public", 60_000);
+    const probe = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<AbortSignal>();
+    const registry = new WorkerLeases(
+      {
+        admit: async () => allowed(current),
+        renew: async (previous) => allowed(previous),
+      },
+      async (candidate) => {
+        started.resolve(candidate.signal);
+        await probe.promise;
+      },
+    );
+    try {
+      expect((await registry.admit(hostname, credential)).kind).toBe("allowed");
+      const attempt = registry.runMaintenance(
+        grant("competing", "maintenance", 60_000),
+        new AbortController().signal,
+        async () => {
+          throw new Error("stale probe executed");
+        },
+      );
+      const stale = expect(attempt).rejects.toThrow("worker_maintenance_stale_target");
+      const candidate = await started.promise;
+      current = grant("new", "public-new", 60_000);
+      const next = await registry.admit(hostname, credential);
+      if (next.kind !== "allowed") throw new Error("new admission failed");
+      probe.resolve();
+      await stale;
+      expect(candidate.aborted).toBe(true);
+      expect(next.lease.signal.aborted).toBe(false);
+    } finally {
+      probe.resolve();
+      registry.close();
     }
   });
 

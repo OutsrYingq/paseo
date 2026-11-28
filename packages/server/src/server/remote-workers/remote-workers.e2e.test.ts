@@ -6,13 +6,15 @@ import os from "node:os";
 import path from "node:path";
 import pino from "pino";
 import { afterEach, expect, it } from "vitest";
-import WebSocket from "ws";
+import { WebSocket } from "ws";
 import { DaemonClient, type WebSocketLike } from "@getpaseo/client/internal/daemon-client";
 import {
   createNativeExecution,
   startRemoteCentral,
   startResidentExecution,
   type WorkerAuthority,
+  type WorkerGrant,
+  type WorkerMaintenanceOperation,
   type WorkerTarget,
 } from "./index.js";
 
@@ -48,6 +50,7 @@ const provider = process.argv[2];
 const send = (message) => process.stdout.write(JSON.stringify(message) + '\n');
 const state = { isStreaming: false, isCompacting: false, sessionId: 'shared-native-id', sessionFile: process.env.FIXTURE_STATE + '/native.jsonl', messageCount: 0, queuedMessageCount: 0 };
 const count = () => fs.appendFileSync(process.env.FIXTURE_STATE + '/prompts', 'prompt\n');
+const turnHeld = () => fs.existsSync(process.env.FIXTURE_STATE + '/hold-turn');
 if (provider === 'omp') send({ type: 'ready', protocolVersion: 1, supportedProtocolVersions: [1] });
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const command = JSON.parse(line);
@@ -55,11 +58,17 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   if (!id) return;
   if (provider === 'codex') {
     if (method === 'turn/start') count();
-    const result = ({ initialize: { userAgent: 'fixture' }, 'model/list': { data: [{ id: 'fixture', model: 'fixture', isDefault: true, displayName: 'Fixture', description: 'fixture', hidden: false, supportedReasoningEfforts: [], defaultReasoningEffort: 'medium' }] }, 'thread/start': { thread: { id: 'shared-native-id' } }, 'thread/resume': { thread: { id: 'shared-native-id' } }, 'turn/start': { turn: { id: 't1', status: 'inProgress' } } })[method] ?? {};
+    if (method === 'thread/start' || method === 'thread/resume') fs.writeFileSync(process.env.FIXTURE_STATE + '/session-pid', String(process.pid));
+    if (method === 'thread/resume') fs.appendFileSync(process.env.FIXTURE_STATE + '/resumes', 'resume\n');
+    const result = ({ initialize: { userAgent: 'fixture' }, 'model/list': { data: [{ id: 'fixture', model: 'fixture', isDefault: true, displayName: 'Fixture', description: 'fixture', hidden: false, supportedReasoningEfforts: [], defaultReasoningEffort: 'medium' }] }, 'thread/start': { thread: { id: 'shared-native-id' } }, 'thread/resume': { thread: { id: 'shared-native-id' } }, 'thread/read': { thread: { id: 'shared-native-id', turns: [{ id: 't1', status: 'interrupted', items: [{ id: 'rehydrated', type: 'userMessage', content: [{ type: 'text', text: 'provider history', text_elements: [] }] }] }] } }, 'turn/start': { turn: { id: 't1', status: 'inProgress' } } })[method] ?? {};
     send({ id, result });
     if (method === 'turn/start') {
       send({ method: 'turn/started', params: { threadId: 'shared-native-id', turn: { id: 't1', status: 'inProgress' } } });
-      setTimeout(() => send({ method: 'turn/completed', params: { threadId: 'shared-native-id', turn: { id: 't1', status: 'completed' } } }), 250);
+      if (!turnHeld()) setTimeout(() => send({ method: 'turn/completed', params: { threadId: 'shared-native-id', turn: { id: 't1', status: 'completed' } } }), 250);
+    }
+    if (method === 'turn/interrupt') {
+      fs.appendFileSync(process.env.FIXTURE_STATE + '/interrupts', 'interrupt\n');
+      send({ method: 'turn/completed', params: { threadId: 'shared-native-id', turn: { id: 't1', status: 'interrupted' } } });
     }
   } else {
     const result = ({ get_state: state, get_messages: { messages: [] }, get_available_commands: { commands: [] }, get_available_models: { models: [{ provider: 'fixture', id: 'test', name: 'Fixture OMP' }] }, get_session_stats: {}, prompt: { agentInvoked: true } })[type] ?? {};
@@ -67,7 +76,11 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     send({ id, type: 'response', command: type, success: true, data: result });
     if (type === 'prompt') {
       send({ type: 'agent_start' });
-      setTimeout(() => send({ type: 'agent_end', messages: [] }), 250);
+      const finish = () => {
+        if (turnHeld()) setTimeout(finish, 25);
+        else send({ type: 'agent_end', messages: [{ role: 'assistant', content: [{ type: 'text', text: 'finished' }] }] });
+      };
+      setTimeout(finish, 250);
     }
   }
 });
@@ -75,7 +88,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
-  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  while (cleanups.length > 0) await cleanups.pop()?.();
 });
 
 function openClient(
@@ -134,6 +147,9 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const script = path.join(root, "fixture.cjs");
   await writeFile(script, nativeFixture);
+  const failRestart = new Set<string>();
+  const restartFailures: string[] = [];
+  const residents = new Map<string, Awaited<ReturnType<typeof startResidentExecution>>>();
   const targets = new Map<string, { password: string; target: WorkerTarget }>();
   for (const [label, provider] of [
     ["a", "codex"],
@@ -226,10 +242,24 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
       listen: { host: "127.0.0.1", port: 0 },
       tls,
       authorizeCentral: (fingerprint) => fingerprint === tls.fingerprint,
-      openRuntime: native.openRuntime,
+      async openRuntime(...args) {
+        const runtime = await native.openRuntime(...args);
+        return {
+          ...runtime,
+          async restartRuntime(keepTerminals) {
+            if (failRestart.has(label)) throw new Error("fixture reset failure");
+            await runtime.restartRuntime?.(keepTerminals);
+          },
+        };
+      },
       shutdownRuntime: native.close,
-      onError: (error) => logger.error({ error }),
+      onError(error) {
+        if (error instanceof Error && error.message === "fixture reset failure") {
+          restartFailures.push(label);
+        } else logger.error({ error });
+      },
     });
+    residents.set(label, resident);
     cleanups.push(() => resident.close());
     targets.set(`${label}.paseo.test`, {
       password: `password-${label}`,
@@ -237,6 +267,7 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
         ...binding,
         endpoint: `wss://127.0.0.1:${resident.port}/execute`,
         certFingerprint256: tls.fingerprint,
+        revision: 1,
       },
     });
   }
@@ -270,7 +301,32 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
     logger,
   });
   cleanups.push(() => central.close());
-  const a = openClient(central.port, "a.paseo.test", "password-a");
+  const maintenanceSignal = new AbortController().signal;
+  const grant: WorkerGrant = {
+    hostname: "a.paseo.test",
+    target: targets.get("a.paseo.test")!.target,
+    principalId: "ops-runtime",
+    leaseId: "maintenance-fixture",
+    scope: ["daemon.read", "workspace.read", "workspace.write"],
+    expiresAt: Date.now() + 60_000,
+  };
+  const runMaintenance = <Operation extends WorkerMaintenanceOperation>(operation: Operation) =>
+    central.maintenance(grant, operation, maintenanceSignal);
+  const refreshDirectory = await runMaintenance({
+    type: "refresh_providers_snapshot_request",
+    requestId: "catalog",
+    providers: ["codex"],
+    cwd: path.join(root, "a"),
+  });
+  expect(refreshDirectory.acknowledged).toBe(true);
+  const maintenanceModels = await runMaintenance({
+    type: "list_provider_models_request",
+    requestId: "models",
+    provider: "codex",
+    cwd: path.join(root, "a"),
+  });
+  expect(maintenanceModels.models?.map(({ id }) => id)).toEqual(["fixture"]);
+  let a = openClient(central.port, "a.paseo.test", "password-a");
   const b = openClient(central.port, "b.paseo.test", "password-b");
   await Promise.all([a.connect(), b.connect()]);
   expect(a.getLastServerInfoMessage()?.serverId).toBe("srv_a");
@@ -310,13 +366,8 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
         snapshot() {},
         update(message) {
           if (message.type !== "providers_snapshot_update" || message.payload.cwd !== cwd) return;
-          if (
-            message.payload.entries.some(
-              (entry) =>
-                entry.provider === provider && entry.models?.some((model) => model.id === modelId),
-            )
-          )
-            ready.resolve();
+          const entry = message.payload.entries.find((item) => item.provider === provider);
+          if (entry?.models?.some((model) => model.id === modelId)) ready.resolve();
         },
       });
       await events.ready;
@@ -393,13 +444,89 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
   for (const label of ["a", "b"])
     expect(await readFile(path.join(root, label, "prompts"), "utf8")).toBe("prompt\n");
   await a.cancelAgent(agentId);
-  const readOnly = openClient(central.port, "a.paseo.test", "password-a", ["workspace.read"]);
-  await readOnly.connect();
-  expect((await readOnly.fetchAgent(agentId))?.agent.id).toBe(agentId);
-  await expect(readOnly.archiveAgent(agentId)).rejects.toThrow("Permission denied");
-  const archived = await a.archiveAgent(agentId);
-  expect(archived.archivedAt).toBeTruthy();
-  expect((await b.fetchAgent(agentId))?.agent.archivedAt).toBeFalsy();
+  const fetchAgent = { type: "fetch_agent_request", requestId: "fetch", agentId } as const;
+  async function checkPermissions() {
+    const readOnly = openClient(central.port, "a.paseo.test", "password-a", ["workspace.read"]);
+    await readOnly.connect();
+    expect((await readOnly.fetchAgent(agentId))?.agent.id).toBe(agentId);
+    await expect(readOnly.archiveAgent(agentId)).rejects.toThrow("Permission denied");
+    await expect(readOnly.refreshAgent(agentId)).rejects.toThrow("Permission denied");
+    await expect(readOnly.restartServer()).rejects.toThrow("Permission denied");
+    await expect(a.refreshAgent("missing")).rejects.toMatchObject({ code: "agent_refresh_failed" });
+    const page = await runMaintenance({
+      type: "fetch_agents_request",
+      requestId: "page",
+      page: { limit: 1 },
+    });
+    expect(page.entries.map(({ agent }) => agent.provider)).toEqual(["codex"]);
+    expect(
+      (await runMaintenance({ type: "fetch_agent_request", requestId: "find", agentId })).agent
+        ?.provider,
+    ).toBe("codex");
+    await expect(
+      central.maintenance(
+        { ...grant, target: { ...grant.target, podUid: "stale" } },
+        fetchAgent,
+        maintenanceSignal,
+      ),
+    ).rejects.toThrow("worker_maintenance_unconfirmed");
+    await expect(
+      central.maintenance({ ...grant, expiresAt: Date.now() - 1 }, fetchAgent, maintenanceSignal),
+    ).rejects.toThrow("worker_maintenance_expired");
+    await expect(
+      central.maintenance({ ...grant, scope: ["daemon.read"] }, fetchAgent, maintenanceSignal),
+    ).rejects.toThrow("worker_maintenance_permission_denied");
+    return readOnly;
+  }
+  const readOnly = await checkPermissions();
+  async function checkScopedRefresh() {
+    const holdA = path.join(root, "a", "hold-turn");
+    const holdB = path.join(root, "b", "hold-turn");
+    await Promise.all([writeFile(holdA, ""), writeFile(holdB, "")]);
+    await Promise.all(
+      [a, b].map((client) => client.sendAgentMessage(agentId, "held", { messageId: "held-turn" })),
+    );
+    expect((await a.fetchAgent(agentId))?.agent.status).toBe("running");
+    expect((await b.fetchAgent(agentId))?.agent.status).toBe("running");
+    const countResumes = async () =>
+      (
+        await readFile(path.join(root, "a", "resumes"), "utf8").catch(
+          (error: NodeJS.ErrnoException) => {
+            if (error.code === "ENOENT") return "";
+            throw error;
+          },
+        )
+      ).split("resume\n").length - 1;
+    const beforePublicRefresh = await countResumes();
+    expect(await a.refreshAgent(agentId)).toMatchObject({ status: "agent_refreshed", agentId });
+    const beforeMaintenance = await countResumes();
+    expect(beforeMaintenance).toBeGreaterThan(beforePublicRefresh);
+    expect((await a.fetchAgentTimeline(agentId)).entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          item: expect.objectContaining({ type: "user_message", text: "provider history" }),
+        }),
+      ]),
+    );
+    expect(await readFile(path.join(root, "a", "interrupts"), "utf8")).toContain("interrupt\n");
+    expect((await b.fetchAgent(agentId))?.agent.status).toBe("running");
+    await Promise.all([rm(holdA), rm(holdB)]);
+    await expect.poll(async () => (await b.fetchAgent(agentId))?.agent.status).toBe("idle");
+    expect(
+      await runMaintenance({ type: "refresh_agent_request", agentId, requestId: "refresh" }),
+    ).toMatchObject({
+      status: "agent_refreshed",
+      agentId,
+      requestId: "refresh",
+    });
+    expect(await countResumes()).toBeGreaterThan(beforeMaintenance);
+    for (const label of ["a", "b"])
+      expect(await readFile(path.join(root, label, "prompts"), "utf8")).toBe("prompt\nprompt\n");
+    const archived = await a.archiveAgent(agentId);
+    expect(archived.archivedAt).toBeTruthy();
+    expect((await b.fetchAgent(agentId))?.agent.archivedAt).toBeFalsy();
+  }
+  await checkScopedRefresh();
   const creations = path.join(root, "a", "creations");
   const receipt = (await readdir(creations)).find((file) => file.endsWith(".json"));
   expect(await readFile(path.join(creations, receipt!), "utf8")).toContain("completed");
@@ -440,70 +567,163 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
   const [termA, termB] = terminals;
   expect(termA.error).toBeNull();
   expect(termB.error).toBeNull();
+  if (!termA.terminal || !termB.terminal) throw new Error("Remote terminals were not created");
+  const terminalA = termA.terminal.id;
+  const terminalB = termB.terminal.id;
   const view = (client: DaemonClient, terminalId: string) => {
     let contents = "";
     const subscription = client.observeTerminal(terminalId, (event) => {
-      const bytes =
-        event.type === "output"
-          ? event.data
-          : event.replay.type === "data"
-            ? event.replay.data
-            : undefined;
-      if (bytes) contents += Buffer.from(bytes).toString("utf8");
+      if (event.type === "output") contents += Buffer.from(event.data).toString("utf8");
+      else if (event.replay.type === "data")
+        contents += Buffer.from(event.replay.data).toString("utf8");
     });
     cleanups.push(() => subscription.release());
     return { ready: subscription.ready, contents: () => contents };
   };
-  const [viewA, viewB] = [view(a, termA.terminal?.id!), view(b, termB.terminal?.id!)];
+  const [viewA, viewB] = [view(a, terminalA), view(b, terminalB)];
   await Promise.all([viewA.ready, viewB.ready]);
   await expect.poll(viewA.contents).toContain("terminal-a");
   await expect.poll(viewB.contents).toContain("terminal-b");
   expect(viewA.contents()).not.toContain("terminal-b");
-  await a.killTerminal(termA.terminal?.id!);
-  expect(
-    (await b.listTerminals(undefined, undefined, { workspaceId: "same-workspace" })).terminals.map(
-      ({ id }) => id,
-    ),
-  ).toContain(termB.terminal?.id);
-  await b.killTerminal(termB.terminal?.id!);
+  const markerBeforeRestart = await rpc(a);
+  await a.refreshAgent(agentId);
+  const pidPath = path.join(root, "a", "session-pid");
+  const pidBeforeRestart = Number(await readFile(pidPath, "utf8"));
+  const terminalIds = async (client: DaemonClient) =>
+    (
+      await client.listTerminals(undefined, undefined, { workspaceId: "same-workspace" })
+    ).terminals.map(({ id }) => id);
+  async function restartA(killTerminals: boolean, requestId: string) {
+    const previous = a;
+    expect(
+      await previous.restartServer("settings_update", requestId, { killTerminals }),
+    ).toMatchObject({
+      status: "restart_requested",
+      requestId,
+      clientId: "test-a.paseo.test",
+      reason: "settings_update",
+    });
+    await expect.poll(() => previous.getConnectionState().status).not.toBe("connected");
+    await previous.close();
+    a = openClient(central.port, "a.paseo.test", "password-a");
+    await a.connect();
+  }
+  await restartA(false, "restart-keep");
+  expect(await terminalIds(a)).toContain(terminalA);
+  const reattached = view(a, terminalA);
+  await reattached.ready;
+  await expect.poll(reattached.contents).toContain("terminal-a");
+  expect(await rpc(a)).not.toEqual(markerBeforeRestart);
+  expect(await rpc(b)).toEqual(markerB);
+  expect(() => process.kill(pidBeforeRestart, 0)).toThrow();
+  expect((await a.fetchAgent(agentId))?.agent.id).toBe(agentId);
+  await a.refreshAgent(agentId);
+  expect(Number(await readFile(pidPath, "utf8"))).not.toBe(pidBeforeRestart);
+  await restartA(true, "restart-kill");
+  expect(await terminalIds(a)).not.toContain(terminalA);
+  expect(await terminalIds(b)).toContain(terminalB);
+  expect(await rpc(b)).toEqual(markerB);
+  await b.killTerminal(terminalB);
   const download = await a.requestDownloadToken(path.join(root, "a"), "marker.txt");
   const route = `/api/files/download?token=${encodeURIComponent(download.token!)}`;
   expect((await get(central.port, "b.paseo.test", route)).status).toBe(403);
   expect(await get(central.port, "a.paseo.test", route)).toEqual({ status: 200, body: "a-only" });
   expect((await get(central.port, "a.paseo.test", route)).status).toBe(403);
-  const workspaceId = "wks_0123456789abcdef";
-  const newWorkspace = (
-    client: DaemonClient,
-    label: string,
-    provider: string,
-    onEvent?: (snapshot: { phase: string }) => void,
-  ) =>
-    client.createWorkspace({
-      workspaceId,
-      idempotencyKey: "same-workspace-create",
-      source: { kind: "directory", path: path.join(root, label), projectId: "same-project" },
-      agent: {
-        config: { provider, cwd: path.join(root, label) },
-        initialPrompt: "directory workspace turn",
-      },
-      onEvent,
-    });
-  const workspacePhases: string[] = [];
-  const fresh = await Promise.all([
-    newWorkspace(a, "a", "codex", (snapshot) => workspacePhases.push(snapshot.phase)),
-    newWorkspace(b, "b", "omp"),
-  ]);
-  expect(fresh.map((result) => result.error)).toEqual([null, null]);
-  expect(fresh.map((result) => result.workspace?.id)).toEqual([workspaceId, workspaceId]);
-  expect(fresh.map((result) => result.agent?.provider)).toEqual(["codex", "omp"]);
-  expect(workspacePhases).toContain("workspace_ready");
-  expect((await newWorkspace(a, "a", "codex")).agent?.id).toBe(fresh[0].agent?.id);
-  for (const label of ["a", "b"]) {
-    expect(await readFile(path.join(root, label, "prompts"), "utf8")).toBe("prompt\nprompt\n");
-    expect(
-      JSON.parse(await readFile(path.join(root, label, "projects", "workspaces.json"), "utf8")),
-    ).toEqual(
-      expect.arrayContaining([expect.objectContaining({ workspaceId, projectId: "same-project" })]),
-    );
+  async function checkDirectoryCreation() {
+    const workspaceId = "wks_0123456789abcdef";
+    const newWorkspace = (
+      client: DaemonClient,
+      label: string,
+      provider: string,
+      onEvent?: (snapshot: { phase: string }) => void,
+    ) =>
+      client.createWorkspace({
+        workspaceId,
+        idempotencyKey: "same-workspace-create",
+        source: { kind: "directory", path: path.join(root, label), projectId: "same-project" },
+        agent: {
+          config: { provider, cwd: path.join(root, label) },
+          initialPrompt: "directory workspace turn",
+        },
+        onEvent,
+      });
+    const workspacePhases: string[] = [];
+    const fresh = await Promise.all([
+      newWorkspace(a, "a", "codex", (snapshot) => workspacePhases.push(snapshot.phase)),
+      newWorkspace(b, "b", "omp"),
+    ]);
+    expect(fresh.map((result) => result.error)).toEqual([null, null]);
+    expect(fresh.map((result) => result.workspace?.id)).toEqual([workspaceId, workspaceId]);
+    expect(fresh.map((result) => result.agent?.provider)).toEqual(["codex", "omp"]);
+    expect(workspacePhases).toContain("workspace_ready");
+    expect((await newWorkspace(a, "a", "codex")).agent?.id).toBe(fresh[0].agent?.id);
+    for (const label of ["a", "b"]) {
+      expect(await readFile(path.join(root, label, "prompts"), "utf8")).toBe(
+        "prompt\nprompt\nprompt\n",
+      );
+      expect(
+        JSON.parse(await readFile(path.join(root, label, "projects", "workspaces.json"), "utf8")),
+      ).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ workspaceId, projectId: "same-project" }),
+        ]),
+      );
+    }
   }
+  await checkDirectoryCreation();
+  await a.close();
+  await reopened.close();
+  await readOnly.close();
+  await residents.get("a")!.close();
+  const nextBinding = { workerId: "a", podUid: "pod-a-replacement", serverId: "srv_a" };
+  const nextNative = createNativeExecution({
+    paseoHome: path.join(root, "a"),
+    logger,
+    providers: {},
+  });
+  const nextResident = await startResidentExecution({
+    binding: nextBinding,
+    paseoHome: path.join(root, "a"),
+    listen: { host: "127.0.0.1", port: 0 },
+    tls,
+    authorizeCentral: (fingerprint) => fingerprint === tls.fingerprint,
+    async openRuntime(...args) {
+      const { execute, close } = await nextNative.openRuntime(...args);
+      return { execute, close };
+    },
+    shutdownRuntime: nextNative.close,
+    onError: (error) => logger.error({ error }),
+  });
+  cleanups.push(() => nextResident.close());
+  const replacement = {
+    ...grant,
+    target: {
+      ...grant.target,
+      ...nextBinding,
+      endpoint: `wss://127.0.0.1:${nextResident.port}/execute`,
+    },
+    expiresAt: Date.now() + 30_000,
+  };
+  expect((await central.maintenance(replacement, fetchAgent, maintenanceSignal)).agent?.id).toBe(
+    agentId,
+  );
+  await expect(central.maintenance(grant, fetchAgent, maintenanceSignal)).rejects.toThrow(
+    "worker_maintenance_stale_target",
+  );
+  expect((await central.maintenance(replacement, fetchAgent, maintenanceSignal)).agent?.id).toBe(
+    agentId,
+  );
+  targets.get("a.paseo.test")!.target = replacement.target;
+  const oldRuntime = openClient(central.port, "a.paseo.test", "password-a");
+  await oldRuntime.connect();
+  expect(oldRuntime.getLastServerInfoMessage()?.features?.terminalsSurviveRestart).toBeUndefined();
+  await expect(oldRuntime.restartServer()).rejects.toMatchObject({
+    code: "worker_restart_unsupported",
+  });
+  expect((await oldRuntime.fetchAgent(agentId))?.agent.id).toBe(agentId);
+  expect(await rpc(b)).toEqual(markerB);
+  failRestart.add("b");
+  await expect(b.restartServer()).rejects.toMatchObject({ code: "worker_restart_unconfirmed" });
+  await expect.poll(() => restartFailures).toEqual(["b"]);
+  expect((await oldRuntime.fetchAgent(agentId))?.agent.id).toBe(agentId);
 });

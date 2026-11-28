@@ -1,8 +1,8 @@
-﻿import { z } from "zod";
 import {
   AgentStreamEventPayloadSchema,
   FileExplorerResponseSchema,
 } from "@getpaseo/protocol/messages";
+import { z } from "zod";
 import {
   RemoteTerminalOperationSchema,
   RemoteTerminalEventSchema,
@@ -17,6 +17,8 @@ import { WorkerBindingSchema } from "./leases.js";
 
 export const EXECUTION_PROTOCOL = "paseo.worker.v1";
 export const EXECUTION_PATH = "/execute";
+export const EXECUTION_FEATURES_HEADER = "x-paseo-execution-features";
+export const RUNTIME_RESTART_FEATURE = "restart-runtime";
 export const EXECUTION_MAX_FRAME = 32 * 1024 * 1024;
 export const EXECUTION_MAX_CALLS = 128;
 
@@ -45,6 +47,7 @@ const fileTarget = { cwd: z.string().min(1), path: z.string().min(1) };
 export const WorkerOperationSchema = z.discriminatedUnion("kind", [
   ...RemoteTerminalOperationSchema.options,
   RemotePluginOperationSchema,
+  z.strictObject({ kind: z.literal("restartRuntime"), keepTerminals: z.boolean() }),
   z.strictObject({
     kind: z.literal("ompHistoryOpen"),
     sessionFile: z.string().min(1),
@@ -124,7 +127,11 @@ const WorkerEventSchema = z.discriminatedUnion("type", [
 ]);
 
 export const ExecutionResponseSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("bound"), binding: WorkerBindingSchema }),
+  z.strictObject({
+    kind: z.literal("bound"),
+    binding: WorkerBindingSchema,
+    restartRuntime: z.literal(true).optional(),
+  }),
   z.strictObject({
     kind: z.literal("result"),
     id: z.uuid(),
@@ -141,6 +148,7 @@ export type WorkerEvent = z.infer<typeof WorkerEventSchema>;
 export const operationResults = {
   ...remoteTerminalOperationResults,
   plugin: RemotePluginResultSchema,
+  restartRuntime: z.null(),
   providerHome: z.string().min(1),
   workspacePath: z.string().nullable(),
   ompHistoryOpen: z.uuid(),

@@ -12,6 +12,7 @@ import { AgentManager, type AgentManagerOptions } from "../agent/agent-manager.j
 import { buildStoredAgentPayload } from "../agent/agent-projections.js";
 import {
   sendPreparedPromptToAgent,
+  unarchiveAgentState,
   waitForAgentRunStartWithTimeout,
 } from "../agent/agent-prompt.js";
 import type { AgentClient } from "../agent/agent-sdk-types.js";
@@ -23,7 +24,11 @@ import { shutdownAgentClients } from "../agent/provider-registry.js";
 import { CreationService } from "../creation/index.js";
 import { MessageReceipts } from "../message-receipts/index.js";
 import { serializeAgentSnapshot, serializeAgentStreamEvent } from "../messages.js";
-import { attachAgentStoragePersistence } from "../persistence-hooks.js";
+import {
+  attachAgentStoragePersistence,
+  isStoredAgentProviderAvailable,
+  toAgentPersistenceHandle,
+} from "../persistence-hooks.js";
 import { WorkerOperationError } from "./execution-protocol.js";
 import type { createRemoteState } from "./remote-state.js";
 import { ensureAgentLoaded } from "../agent/agent-loading.js";
@@ -315,6 +320,24 @@ export async function openCentralAgents(
     return null;
   }
 
+  let closing: Promise<void> | undefined;
+  function close() {
+    return (closing ??= (async () => {
+      catalog.destroy();
+      stopEvents();
+      manager.prepareForShutdown();
+      const closed = await Promise.allSettled(
+        manager.listAgents({ includeInternal: true }).map((agent) => manager.closeAgent(agent.id)),
+      );
+      await manager.flushForShutdown();
+      detachStorage();
+      await storage.flush();
+      await shutdownAgentClients(Object.values(clients), logger);
+      const failed = closed.find((result) => result.status === "rejected");
+      if (failed) throw failed.reason;
+    })());
+  }
+
   return {
     setPluginClients(pluginClients: Record<string, AgentClient>) {
       const previous = manager.getRegisteredProviderIds();
@@ -334,6 +357,31 @@ export async function openCentralAgents(
     sendMessage,
     cancelAgent: (id: string) => cancelAgentRunCommand(dependencies, id),
     archiveAgent: (id: string) => archiveAgentCommand(dependencies, id),
+    async refreshAgent(agentId: string, request: AbortSignal) {
+      requireActive(request);
+      await unarchiveAgentState(storage, manager, agentId);
+      requireActive(request);
+      if (manager.getAgent(agentId)) {
+        // The manager cancels an in-flight run in its per-agent lifecycle lane before reopening.
+        await manager.reloadAgentSession(agentId, undefined, { rehydrateFromDisk: true });
+        requireActive(request);
+        await manager.hydrateTimelineFromProvider(agentId, { broadcast: true });
+      } else {
+        const record = await storage.get(agentId);
+        if (!record) throw new Error(`Agent not found: ${agentId}`);
+        const registered = manager.getRegisteredProviderIds();
+        if (!isStoredAgentProviderAvailable(record, registered)) {
+          throw new Error(`Agent ${agentId} references unavailable provider '${record.provider}'`);
+        }
+        if (!toAgentPersistenceHandle(registered, record.persistence)) {
+          throw new Error(`Agent ${agentId} cannot be refreshed because it lacks persistence`);
+        }
+        requireActive(request);
+        await ensureAgentLoaded(agentId, { ...dependencies, broadcastTimeline: true });
+      }
+      requireActive(request);
+      return manager.getTimeline(agentId).length;
+    },
     async listAgents() {
       const records = await storage.listAll();
       const agents = await Promise.all(
@@ -376,13 +424,11 @@ export async function openCentralAgents(
           hasOlder: page.hasOlder,
           hasNewer: page.hasNewer,
           entries: page.rows
-            .filter(({ item }) =>
-              item.type === "notification"
-                ? projection.notification
-                : item.type === "plugin"
-                  ? projection.plugin
-                  : true,
-            )
+            .filter(({ item }) => {
+              if (item.type === "notification") return projection.notification;
+              if (item.type === "plugin") return projection.plugin;
+              return true;
+            })
             .map((entry) => ({
               provider: agent.provider,
               item: entry.item,
@@ -426,13 +472,10 @@ export async function openCentralAgents(
       const snapshot = manager.getAgent(agentId);
       if (!snapshot) {
         const final = await readAgent(agentId);
+        let status: "timeout" | "idle" | "error" = "error";
+        if (final) status = final.status === "running" ? "timeout" : "idle";
         return {
-          status:
-            final?.status === "running"
-              ? ("timeout" as const)
-              : final
-                ? ("idle" as const)
-                : ("error" as const),
+          status,
           final,
           lastMessage: null,
           error: final ? null : "agent_not_found",
@@ -447,14 +490,12 @@ export async function openCentralAgents(
           throw error;
         });
       const final = await readAgent(agentId);
+      let status: "permission" | "error" | "timeout" | "idle" = "idle";
+      if (result.permission) status = "permission";
+      else if (result.status === "error") status = "error";
+      else if (result.status === "running") status = "timeout";
       return {
-        status: result.permission
-          ? ("permission" as const)
-          : result.status === "error"
-            ? ("error" as const)
-            : result.status === "running"
-              ? ("timeout" as const)
-              : ("idle" as const),
+        status,
         final,
         lastMessage: result.lastMessage,
         error: final?.lastError ?? null,
@@ -465,19 +506,6 @@ export async function openCentralAgents(
       key: string,
       observe: (value: CreationSnapshot) => void,
     ) => creations.subscribe(kind, key, observe),
-    async close() {
-      catalog.destroy();
-      stopEvents();
-      manager.prepareForShutdown();
-      const closing = await Promise.allSettled(
-        manager.listAgents({ includeInternal: true }).map((agent) => manager.closeAgent(agent.id)),
-      );
-      detachStorage();
-      await manager.flushForShutdown();
-      await storage.flush();
-      await shutdownAgentClients(Object.values(clients), logger);
-      const failed = closing.find((result) => result.status === "rejected");
-      if (failed) throw failed.reason;
-    },
+    close,
   };
 }

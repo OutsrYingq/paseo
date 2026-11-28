@@ -1,12 +1,14 @@
-﻿import { Agent as HttpsAgent } from "node:https";
 import { randomUUID } from "node:crypto";
+import { Agent as HttpsAgent } from "node:https";
 import { checkServerIdentity, type ConnectionOptions, type PeerCertificate } from "node:tls";
-import WebSocket from "ws";
+import { WebSocket } from "ws";
 import { sameWorkerBinding, type ActiveWorkerTarget } from "./leases.js";
 import {
+  EXECUTION_FEATURES_HEADER,
   EXECUTION_MAX_CALLS,
   EXECUTION_MAX_FRAME,
   EXECUTION_PROTOCOL,
+  RUNTIME_RESTART_FEATURE,
   ExecutionResponseSchema,
   WorkerOperationError,
   decodeJson,
@@ -30,11 +32,16 @@ export class WorkerConnection {
   private readonly binding: Promise<void>;
   private readonly lifetime = new AbortController();
   readonly signal = this.lifetime.signal;
+  private runtimeRestart = false;
+
+  get supportsRuntimeRestart() {
+    return this.runtimeRestart;
+  }
 
   constructor(
     lease: ActiveWorkerTarget,
     tls: WorkerTlsClientOptions,
-    onEvent: (event: WorkerEvent) => void,
+    private onEvent: (event: WorkerEvent) => void = () => {},
   ) {
     const { workerId, podUid, serverId } = lease.target;
     const binding = { workerId, podUid, serverId };
@@ -55,6 +62,7 @@ export class WorkerConnection {
     });
     this.socket = new WebSocket(endpoint, EXECUTION_PROTOCOL, {
       agent,
+      headers: { [EXECUTION_FEATURES_HEADER]: RUNTIME_RESTART_FEATURE },
       followRedirects: false,
       handshakeTimeout: 5_000,
       maxPayload: EXECUTION_MAX_FRAME,
@@ -86,6 +94,7 @@ export class WorkerConnection {
         if (!bound) {
           if (message.kind !== "bound" || !sameWorkerBinding(binding, message.binding))
             return this.close();
+          this.runtimeRestart = message.restartRuntime === true;
           bound = true;
           clearTimeout(timer);
           resolve();
@@ -93,7 +102,7 @@ export class WorkerConnection {
         }
         if (message.kind === "bound") return this.close();
         if (message.kind === "event") {
-          onEvent(message.event);
+          this.onEvent(message.event);
           return;
         }
         const pending = this.pending.get(message.id);
@@ -104,6 +113,10 @@ export class WorkerConnection {
       });
     });
     void this.binding.catch(() => undefined);
+  }
+
+  setEventHandler(handler: (event: WorkerEvent) => void) {
+    this.onEvent = handler;
   }
 
   async ready(): Promise<void> {
