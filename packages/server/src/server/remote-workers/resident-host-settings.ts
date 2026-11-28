@@ -6,7 +6,7 @@ import { loadPersistedConfig, type PersistedConfig } from "../persisted-config.j
 import { getPidLockInfo } from "../pid-lock.js";
 import {
   RemoteHostConfigSchema,
-  RemoteHostProfilesPatchSchema,
+  RemoteHostConfigPatchSchema,
   remoteHostProfileControlKeys,
   type RemoteHostSettingsOperation,
 } from "./remote-host-settings-protocol.js";
@@ -55,6 +55,10 @@ export function createResidentHostSettings(options: {
       ...initial,
       ...readProfiles(persisted),
       usage: { enabled: persisted.daemon?.usage?.enabled !== false },
+      metadataGeneration: {
+        providers: persisted.agents?.metadataGeneration?.providers ?? [],
+        instructions: persisted.agents?.metadataGeneration?.instructions,
+      },
       relay: { enabled: false },
       pluginsEnabled: persisted.pluginsEnabled,
       plugins: persisted.plugins,
@@ -70,6 +74,10 @@ export function createResidentHostSettings(options: {
               ...configStore.get(),
               ...readProfiles(next),
               usage: { enabled: next.daemon?.usage?.enabled !== false },
+              metadataGeneration: {
+                providers: next.agents?.metadataGeneration?.providers ?? [],
+                instructions: next.agents?.metadataGeneration?.instructions,
+              },
             },
             overrideControlledPaths: operatorControlledPaths,
           };
@@ -79,7 +87,7 @@ export function createResidentHostSettings(options: {
   );
 
   function readConfig() {
-    const { agentProfiles, terminalProfiles, pluginsEnabled } = toWireDaemonConfig(
+    const { agentProfiles, terminalProfiles, pluginsEnabled, usage, metadataGeneration } = toWireDaemonConfig(
       configStore.get(),
     );
     return RemoteHostConfigSchema.parse({
@@ -87,6 +95,8 @@ export function createResidentHostSettings(options: {
       agentProfiles: agentProfiles ?? [],
       terminalProfiles,
       pluginsEnabled,
+      usage,
+      metadataGeneration,
     });
   }
 
@@ -115,7 +125,7 @@ export function createResidentHostSettings(options: {
         case "hostSettingsGet":
           return readConfig();
         case "hostSettingsPatch": {
-          const patch = RemoteHostProfilesPatchSchema.safeParse(operation.config);
+          const patch = RemoteHostConfigPatchSchema.safeParse(operation.config);
           if (!patch.success)
             throw new WorkerOperationError("worker_host_settings_patch_unsupported");
           if (Object.keys(patch.data).length) {

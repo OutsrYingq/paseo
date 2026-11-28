@@ -6,6 +6,7 @@
   TerminalProfileSchema,
 } from "@getpaseo/protocol/messages";
 import { z } from "zod";
+import { AgentMetadataGenerationSchema } from "../persisted-config.js";
 
 // These are the composer controls implemented by the remote native providers.
 const profileControls = z.object({
@@ -16,8 +17,9 @@ const profileControls = z.object({
 export const remoteHostProfileControlKeys = Object.keys(profileControls.shape);
 const agentProfile = AgentProfileSchema.strip();
 const terminalProfile = TerminalProfileSchema.strip();
+const usage = z.strictObject({ enabled: z.boolean() });
 
-export const RemoteHostProfilesPatchSchema = z.strictObject({
+export const RemoteHostConfigPatchSchema = z.strictObject({
   agentProfiles: z
     .array(
       agentProfile
@@ -29,6 +31,8 @@ export const RemoteHostProfilesPatchSchema = z.strictObject({
     )
     .optional(),
   terminalProfiles: z.array(terminalProfile.strict()).optional(),
+  usage: usage.optional(),
+  metadataGeneration: AgentMetadataGenerationSchema.optional(),
 });
 
 export const RemoteHostConfigSchema = z.strictObject({
@@ -43,7 +47,8 @@ export const RemoteHostConfigSchema = z.strictObject({
   pluginsEnabled: z.boolean().optional(),
   browserTools: z.strictObject({ enabled: z.literal(false) }),
   providers: z.strictObject({}),
-  metadataGeneration: z.strictObject({ providers: z.tuple([]) }),
+  metadataGeneration: AgentMetadataGenerationSchema.required({ providers: true }),
+  usage: usage.optional(),
   autoArchiveAfterMerge: z.literal(false),
   enableTerminalAgentHooks: z.literal(false),
   appendSystemPrompt: z.literal(""),
@@ -53,7 +58,7 @@ export type RemoteHostConfig = z.output<typeof RemoteHostConfigSchema>;
 
 export const RemoteHostSettingsOperationSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("hostSettingsGet") }),
-  z.strictObject({ kind: z.literal("hostSettingsPatch"), config: RemoteHostProfilesPatchSchema }),
+  z.strictObject({ kind: z.literal("hostSettingsPatch"), config: RemoteHostConfigPatchSchema }),
   z.strictObject({ kind: z.literal("hostSettingsReload") }),
   z.strictObject({ kind: z.literal("hostStatus"), includeProviders: z.boolean().optional() }),
   z.strictObject({ kind: z.literal("hostDiagnostics") }),

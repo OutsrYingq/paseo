@@ -24,6 +24,7 @@ import {
   CheckoutQueryResponseSchema,
 } from "../session/checkout/checkout-queries-protocol.js";
 import { CheckoutActionSchema, CheckoutActionResultSchema } from "../session/checkout/checkout-actions-protocol.js";
+import { AgentMetadataGenerationSchema } from "../persisted-config.js";
 import { PersistedProjectRecordSchema } from "../workspace-registry.js";
 import {
   RemoteDiffOperationSchema,
@@ -119,6 +120,12 @@ export const WorkerOperationSchema = z.discriminatedUnion("kind", [
   }),
   z.strictObject({ kind: z.literal("checkoutQuery"), request: CheckoutQuerySchema }),
   z.strictObject({ kind: z.literal("checkoutAction"), request: CheckoutActionSchema }),
+  z.strictObject({
+    kind: z.literal("checkoutMetadata"),
+    cwd: z.string().min(1),
+    mode: z.enum(["commit", "pullRequest"]),
+    baseRef: z.string().optional(),
+  }),
   ...RemoteDiffOperationSchema.options,
   ...RemoteScriptOperationSchema.options,
   z.strictObject({ kind: z.literal("downloadOpen"), ...fileTarget }),
@@ -218,6 +225,7 @@ export const WORKSPACE_OPERATION_KINDS: ReadonlySet<WorkerOperation["kind"]> = n
   "unobserveWorkspaceFile",
   "checkoutQuery",
   "checkoutAction",
+  "checkoutMetadata",
   ...RemoteDiffOperationSchema.options.map((schema) => schema.shape.kind.value),
   ...RemoteScriptOperationSchema.options.map((schema) => schema.shape.kind.value),
   ...RemoteFileTransferOperationSchema.options.map((schema) => schema.shape.kind.value),
@@ -255,6 +263,11 @@ export const operationResults = {
   unobserveWorkspaceFile: z.null(),
   checkoutQuery: CheckoutQueryResponseSchema,
   checkoutAction: CheckoutActionResultSchema,
+  checkoutMetadata: z.strictObject({
+    cwd: z.string().min(1),
+    prompt: z.string(),
+    metadataGeneration: AgentMetadataGenerationSchema.pick({ providers: true }).optional(),
+  }),
   projectDirectoryParent: z.string().min(1),
   projectDirectoryChange: z.null(),
   inspectProject: PersistedProjectRecordSchema.pick({

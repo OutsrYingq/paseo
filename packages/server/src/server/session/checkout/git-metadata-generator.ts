@@ -98,7 +98,23 @@ export function createGitMetadataGenerator(deps: {
   logger: GitMetadataLogger;
   readHostInstructions?: () => string | undefined;
 }): GitMetadataGenerator {
-  const { workspaceGitService, generation, logger, readHostInstructions } = deps;
+  const prompts = createGitMetadataPrompts(deps);
+  const completion = createGitMetadataCompletion(deps);
+  return {
+    async generateCommitMessage(cwd) {
+      return completion.commit(cwd, await prompts.commit(cwd));
+    },
+    async generatePullRequestText(cwd, baseRef) {
+      return completion.pullRequest(cwd, await prompts.pullRequest(cwd, baseRef));
+    },
+  };
+}
+
+export function createGitMetadataCompletion(deps: {
+  generation: StructuredTextGeneration;
+  logger: GitMetadataLogger;
+}) {
+  const { generation, logger } = deps;
 
   async function generateOrFallback<T>(
     request: StructuredTextGenerationRequest<T>,
@@ -123,6 +139,29 @@ export function createGitMetadataGenerator(deps: {
     }
   }
 
+  return {
+    async commit(cwd: string, prompt: string) {
+      const result = await generateOrFallback(
+        { cwd, prompt, schema: COMMIT_MESSAGE_SCHEMA, schemaName: "CommitMessage", agentTitle: "Commit generator" },
+        { message: COMMIT_MESSAGE_FALLBACK },
+      );
+      return result.message;
+    },
+    pullRequest(cwd: string, prompt: string) {
+      return generateOrFallback(
+        { cwd, prompt, schema: PULL_REQUEST_SCHEMA, schemaName: "PullRequest", agentTitle: "PR generator" },
+        PULL_REQUEST_FALLBACK,
+      );
+    },
+  };
+}
+
+export function createGitMetadataPrompts(deps: {
+  workspaceGitService: GitMetadataDiffSource;
+  readHostInstructions?: () => string | undefined;
+}) {
+  const { workspaceGitService, readHostInstructions } = deps;
+
   async function buildPromptForDiff(input: PromptForDiffInput): Promise<string> {
     const diff = await workspaceGitService.getCheckoutDiff(input.cwd, input.diffOptions);
     const fileList = renderFileList(diff.structured);
@@ -144,8 +183,8 @@ export function createGitMetadataGenerator(deps: {
   }
 
   return {
-    async generateCommitMessage(cwd) {
-      const prompt = await buildPromptForDiff({
+    commit(cwd: string) {
+      return buildPromptForDiff({
         cwd,
         diffOptions: { mode: "uncommitted", includeStructured: true },
         maxPatchChars: MAX_COMMIT_PATCH_CHARS,
@@ -154,21 +193,10 @@ export function createGitMetadataGenerator(deps: {
         styleDefault: "Concise, imperative mood, no trailing period.",
         jsonFieldsHint: "Return JSON only with a single field 'message'.",
       });
-      const result = await generateOrFallback(
-        {
-          cwd,
-          prompt,
-          schema: COMMIT_MESSAGE_SCHEMA,
-          schemaName: "CommitMessage",
-          agentTitle: "Commit generator",
-        },
-        { message: COMMIT_MESSAGE_FALLBACK },
-      );
-      return result.message;
     },
 
-    async generatePullRequestText(cwd, baseRef) {
-      const prompt = await buildPromptForDiff({
+    pullRequest(cwd: string, baseRef?: string) {
+      return buildPromptForDiff({
         cwd,
         diffOptions: { mode: "base", baseRef, includeStructured: true },
         maxPatchChars: MAX_PULL_REQUEST_PATCH_CHARS,
@@ -177,16 +205,6 @@ export function createGitMetadataGenerator(deps: {
         styleDefault: "Clear, descriptive title; body explaining what changed and why.",
         jsonFieldsHint: "Return JSON only with fields 'title' and 'body'.",
       });
-      return generateOrFallback(
-        {
-          cwd,
-          prompt,
-          schema: PULL_REQUEST_SCHEMA,
-          schemaName: "PullRequest",
-          agentTitle: "PR generator",
-        },
-        PULL_REQUEST_FALLBACK,
-      );
     },
   };
 }

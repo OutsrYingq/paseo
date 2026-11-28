@@ -188,6 +188,7 @@ export function createNativeExecution(options: NativeExecutionOptions) {
         logger,
         signal,
         publish,
+        readMetadataGeneration: () => hostSettings.configStore.get().metadataGeneration,
       }));
     const resolveProcess = (id: string) => {
       const entry = processes.get(id);
@@ -524,6 +525,8 @@ export function createNativeExecution(options: NativeExecutionOptions) {
             return checkoutRuntime().query(operation.request);
           case "checkoutAction":
             return checkoutRuntime().action(operation.request);
+          case "checkoutMetadata":
+            return checkoutRuntime().prepareMetadata(operation);
           case "worktreeMaterialize":
             return materializeResidentWorktree({
               roots: options.workspaceRoots ?? [],

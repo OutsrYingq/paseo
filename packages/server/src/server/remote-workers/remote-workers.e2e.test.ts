@@ -72,9 +72,11 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const { id, method, type } = command;
   if (!id) return;
   if (provider === 'codex') {
-    if (method === 'turn/start') {
+    const turnInput = method === 'turn/start' ? JSON.stringify(command.params.input) : '';
+    const generateCommit = turnInput.includes('Write a concise git commit message');
+    if (method === 'turn/start' && !generateCommit) {
       count();
-      fs.writeFileSync(process.env.FIXTURE_STATE + '/last-prompt', JSON.stringify(command.params.input));
+      fs.writeFileSync(process.env.FIXTURE_STATE + '/last-prompt', turnInput);
     }
     if (method === 'thread/start' || method === 'thread/resume') fs.writeFileSync(process.env.FIXTURE_STATE + '/session-pid', String(process.pid));
     if (method === 'thread/resume') fs.appendFileSync(process.env.FIXTURE_STATE + '/resumes', 'resume\n');
@@ -87,6 +89,15 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     send({ id, result });
     if (method === 'turn/start') {
       send({ method: 'turn/started', params: { threadId: 'shared-native-id', turn: { id: 't1', status: 'inProgress' } } });
+      if (generateCommit) {
+        fs.writeFileSync(process.env.FIXTURE_STATE + '/metadata-prompt', turnInput);
+        send({ method: 'item/completed', params: {
+          threadId: 'shared-native-id', turnId: 't1',
+          item: { id: 'generated', type: 'agentMessage', text: JSON.stringify({ message: 'Document generated change' }) }
+        } });
+        send({ method: 'turn/completed', params: { threadId: 'shared-native-id', turn: { id: 't1', status: 'completed' } } });
+        return;
+      }
       if (fs.existsSync(process.env.FIXTURE_STATE + '/require-permission')) {
         send({ jsonrpc: '2.0', id: 8001, method: 'item/commandExecution/requestApproval',
           params: { itemId: 'fixture-command', threadId: 'shared-native-id', turnId: 't1', command: 'echo fixture', cwd: process.env.FIXTURE_STATE } });
@@ -566,6 +577,14 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
       path.join(local, "config.json"),
       JSON.stringify({
         pluginsEnabled: true,
+        ...(provider === "codex" && {
+          agents: {
+            metadataGeneration: {
+              providers: [{ provider: "codex", model: "fixture" }],
+              instructions: "Use the resident commit instructions.",
+            },
+          },
+        }),
         plugins: {
           "fixture-plugin": { source: "directory", path: pluginDir },
         },
@@ -685,6 +704,11 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
       providersSnapshot: true,
       plugins: true,
       pluginManagement: true,
+      projectList: true,
+      workspaceFileEditing: true,
+      fileByteWrites: true,
+      daemonDiagnostics: true,
+      agentForkContextCursor: true,
     });
   }
   const streamedA: string[] = [];
@@ -696,6 +720,12 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
   expect(usageA.reports[0]?.report.windows?.[0]?.usedPct).toBe(37);
   expect(usageB.reports[0]?.report.windows?.[0]?.usedPct).toBe(64);
   expect((await a.listProviderUsage()).providers[0]?.windows[0]?.usedPct).toBe(37);
+  expect((await b.patchDaemonConfig({ usage: { enabled: false } })).config.usage).toEqual({
+    enabled: false,
+  });
+  await expect(b.listUsageReports()).rejects.toThrow("Usage is off on this host.");
+  expect((await a.listUsageReports()).reports[0]?.report.windows?.[0]?.usedPct).toBe(37);
+  await b.patchDaemonConfig({ usage: { enabled: true } });
   const fresh = openClient(central.port, "fresh.paseo.test", "password-fresh");
   await fresh.connect();
   expect((await fresh.listProjects()).projects).toEqual([]);
@@ -1301,6 +1331,17 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
     await expect(b.checkoutCommit(folder, { message: "Wrong worker" })).rejects.toThrow(
       "worker_workspace_root_denied",
     );
+    const metadataGeneration = { instructions: "Use these updated resident instructions." };
+    expect((await a.patchDaemonConfig({ metadataGeneration })).config.metadataGeneration).toEqual({
+      ...metadataGeneration,
+      providers: [{ provider: "codex", model: "fixture" }],
+    });
+    await writeFile(changed, "generated metadata test\n");
+    expect(await a.checkoutCommit(folder, {})).toMatchObject({ success: true, error: null });
+    expect(git("log", "-1", "--format=%s").toString().trim()).toBe("Document generated change");
+    const metadataPrompt = await readFile(path.join(root, "a", "metadata-prompt"), "utf8");
+    expect(metadataPrompt).toContain(metadataGeneration.instructions);
+    expect(metadataPrompt).toContain("+generated metadata test");
     const other = openClient(central.port, "a.paseo.test", "password-a");
     await other.connect();
     const observation = other.observeWorkspaces();
@@ -1501,9 +1542,9 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
   expect((await central.maintenance(replacement, fetchAgent, maintenanceSignal)).agent?.id).toBe(
     agentId,
   );
-  await expect(central.maintenance(grant, fetchAgent, maintenanceSignal)).rejects.toThrow(
-    "worker_maintenance_stale_target",
-  );
+  await expect(
+    central.maintenance({ ...grant, expiresAt: Date.now() + 30_000 }, fetchAgent, maintenanceSignal),
+  ).rejects.toThrow("worker_maintenance_stale_target");
   expect((await central.maintenance(replacement, fetchAgent, maintenanceSignal)).agent?.id).toBe(
     agentId,
   );
@@ -1513,6 +1554,13 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
   expect(oldRuntime.getLastServerInfoMessage()?.features?.terminalsSurviveRestart).toBeUndefined();
   expect(oldRuntime.getLastServerInfoMessage()?.features?.diffSubscription).toBeUndefined();
   expect(oldRuntime.getLastServerInfoMessage()?.features?.pluginRegistry).toBeUndefined();
+  expect(oldRuntime.getLastServerInfoMessage()?.features).toMatchObject({
+    projectList: true,
+    agentForkContextCursor: true,
+  });
+  expect(oldRuntime.getLastServerInfoMessage()?.features?.workspaceFileEditing).toBeUndefined();
+  expect(oldRuntime.getLastServerInfoMessage()?.features?.fileByteWrites).toBeUndefined();
+  expect(oldRuntime.getLastServerInfoMessage()?.features?.daemonDiagnostics).toBeUndefined();
   await expect(oldRuntime.restartServer()).rejects.toMatchObject({
     code: "worker_restart_unsupported",
   });

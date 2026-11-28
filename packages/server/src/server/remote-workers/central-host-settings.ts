@@ -1,7 +1,7 @@
 ﻿import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import { WorkerOperationError } from "./execution-protocol.js";
 import {
-  RemoteHostProfilesPatchSchema,
+  RemoteHostConfigPatchSchema,
   remoteHostSettingsResults,
   type RemoteHostConfig,
   type RemoteHostSettingsCall,
@@ -36,7 +36,7 @@ export function createCentralHostSettings({
           },
         }));
       case "set_daemon_config_request": {
-        const patch = RemoteHostProfilesPatchSchema.safeParse(request.config);
+        const patch = RemoteHostConfigPatchSchema.safeParse(request.config);
         if (!patch.success) {
           return Promise.reject(new WorkerOperationError("worker_host_settings_patch_unsupported"));
         }

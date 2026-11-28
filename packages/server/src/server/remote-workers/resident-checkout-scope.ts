@@ -46,15 +46,28 @@ async function validateDiscardPath(root: string, target: string): Promise<void> 
   }
 }
 
+export async function validateResidentCheckout(
+  roots: readonly string[],
+  cwd: string,
+  baseRef?: string,
+) {
+  const checkout = await validateWorktree(roots, cwd);
+  if (baseRef !== undefined) {
+    if (baseRef.startsWith("-")) throw new WorkerOperationError("worker_checkout_ref_denied");
+    assertSafeGitRef(baseRef, "base branch");
+  }
+  return checkout;
+}
+
 export async function prepareResidentCheckoutAction(
   roots: readonly string[],
   request: CheckoutAction,
 ) {
-  const { root, commonDir } = await validateWorktree(roots, request.cwd);
-  if ("baseRef" in request && request.baseRef !== undefined) {
-    if (request.baseRef.startsWith("-")) throw new WorkerOperationError("worker_checkout_ref_denied");
-    assertSafeGitRef(request.baseRef, "base branch");
-  }
+  const { root, commonDir } = await validateResidentCheckout(
+    roots,
+    request.cwd,
+    "baseRef" in request ? request.baseRef : undefined,
+  );
   if (request.type === "checkout.discard_changes.request") {
     await Promise.all(request.paths.map((target) => validateDiscardPath(root, target)));
   }

@@ -249,7 +249,11 @@ export async function startRemoteCentral(options: CentralOptions) {
         fileObserver,
         diffSubscriptions,
         scripts,
-        checkout: createCentralCheckout(connection, workerDirectory.updateCheckoutBranch),
+        checkout: createCentralCheckout(connection, workerDirectory.updateCheckoutBranch, {
+          manager: value.manager,
+          catalog: value.catalog,
+          logger,
+        }),
         setupObservation,
         history: value.createHistorySession(workerDirectory),
         hostSettings: createCentralHostSettings({
@@ -442,6 +446,7 @@ export async function startRemoteCentral(options: CentralOptions) {
         if (!lease.signal.aborted && authorization.allowsOutbound(outbound)) sendSession(outbound);
       };
       const socketLifetime = new AbortController();
+      let focusedAgentId: string | null = null;
       const sendBinary = (bytes: Uint8Array): Promise<void> => {
         if (lease.signal.aborted || socket.readyState !== WebSocket.OPEN) {
           return Promise.reject(new WorkerOperationError("worker_client_disconnected"));
@@ -897,6 +902,15 @@ export async function startRemoteCentral(options: CentralOptions) {
             sendAuthorized(await scope.scripts.dispatch(operation));
             return;
         }
+        if (operation.type === "client_heartbeat") {
+          focusedAgentId = operation.focusedAgentId;
+          return;
+        }
+        const checkout = scope.checkout(operation, focusedAgentId, lease.signal);
+        if (checkout) {
+          sendAuthorized(await checkout);
+          return;
+        }
         if (await pluginSession.handle(operation)) return;
         await dispatch(
           scope,
@@ -994,21 +1008,30 @@ export async function startRemoteCentral(options: CentralOptions) {
           permissions: authorization.listPermissions(),
           features: {
             agentRequestReceipts: true,
+            workspaceRequestReceipts: true,
             creationLifecycle: true,
             agentMessageProvenance: true,
             agentMessageBatching: true,
             workspaceMultiplicity: true,
             workspaceTerminals: true,
+            projectList: true,
+            agentThinkingUpdate: true,
+            agentForkContext: true,
+            agentForkContextCursor: true,
             ...(scope.connection.supportsWorkspaceOperations && {
               diffSubscription: true,
               workspaceSetupObservation: true,
               workspaceSetupRun: true,
               workspaceRecovery: true,
               workspaceArchiveUndo: true,
+              workspaceFileEditing: true,
+              fileByteWrites: true,
               daemonStatusRpc: true,
+              daemonDiagnostics: true,
               daemonConfigReload: true,
               providerUsageList: true,
               usageSources: true,
+              usageSetting: true,
             }),
             ...(scope.connection.supportsRuntimeRestart &&
             authorization.allowsPermission("daemon.manage")
@@ -1160,11 +1183,6 @@ async function dispatch(
       reply(await archive);
       return;
     }
-  }
-  const checkout = scope.checkout(message);
-  if (checkout) {
-    reply(await checkout);
-    return;
   }
   switch (message.type) {
     case "agent.timeline.set_subscription.request":

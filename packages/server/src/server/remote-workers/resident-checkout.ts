@@ -11,19 +11,20 @@ import {
   type CheckoutAction,
   type CheckoutActionResult,
 } from "../session/checkout/checkout-actions-protocol.js";
-import {
-  createGitMetadataGenerator,
-  type StructuredTextGeneration,
-} from "../session/checkout/git-metadata-generator.js";
+import { createGitMetadataPrompts } from "../session/checkout/git-metadata-generator.js";
+import type { StructuredGenerationDaemonConfig } from "../agent/structured-generation-providers.js";
 import { createGitMutationService } from "../session/git-mutation/git-mutation-service.js";
 import type { CheckoutQuery } from "../session/checkout/checkout-queries-protocol.js";
 import { WorkspaceGitServiceImpl } from "../workspace-git-service.js";
 import { createWorkspaceRuntimeStore } from "../workspace-runtime-store/index.js";
 import { resolveResidentWorkspacePath } from "./resident-projects.js";
-import { WorkerOperationError } from "./execution-protocol.js";
+import { WorkerOperationError, type WorkerOperation } from "./execution-protocol.js";
 import { openResidentDiffChannel } from "./resident-diff.js";
 import type { RemoteDiffEvent } from "./remote-diff-protocol.js";
-import { prepareResidentCheckoutAction } from "./resident-checkout-scope.js";
+import {
+  prepareResidentCheckoutAction,
+  validateResidentCheckout,
+} from "./resident-checkout-scope.js";
 
 export function openResidentCheckoutQueries(options: {
   roots: readonly string[];
@@ -31,8 +32,7 @@ export function openResidentCheckoutQueries(options: {
   logger: Logger;
   signal: AbortSignal;
   publish(event: RemoteDiffEvent): void;
-  generation?: StructuredTextGeneration;
-  readHostInstructions?: () => string | undefined;
+  readMetadataGeneration(): StructuredGenerationDaemonConfig["metadataGeneration"];
 }) {
   const { paseoHome, logger, signal, roots } = options;
   const git = new WorkspaceGitServiceImpl({
@@ -49,16 +49,22 @@ export function openResidentCheckoutQueries(options: {
   const channel = openResidentDiffChannel({ ...options, diffs: diffs.streams, legacy: diffs });
   const gitMutation = createGitMutationService({ workspaceGitService: git, logger });
   const github = createGitHubService();
-  const gitMetadataGenerator = options.generation
-    ? createGitMetadataGenerator({
-        workspaceGitService: git,
-        generation: options.generation,
-        readHostInstructions: options.readHostInstructions,
-        logger,
-      })
-    : undefined;
+  const prompts = createGitMetadataPrompts({
+    workspaceGitService: git,
+    readHostInstructions: () => options.readMetadataGeneration()?.instructions,
+  });
   return {
     diff: channel.execute,
+    async prepareMetadata(operation: Extract<WorkerOperation, { kind: "checkoutMetadata" }>) {
+      const cwd = await resolveResidentWorkspacePath(roots, expandTilde(operation.cwd));
+      await validateResidentCheckout(roots, cwd, operation.baseRef);
+      signal.throwIfAborted();
+      const prompt = operation.mode === "commit"
+        ? await prompts.commit(cwd)
+        : await prompts.pullRequest(cwd, operation.baseRef);
+      const providers = options.readMetadataGeneration()?.providers;
+      return { cwd, prompt, metadataGeneration: providers ? { providers } : undefined };
+    },
     async query(request: CheckoutQuery) {
       const cwd = await resolveResidentWorkspacePath(roots, expandTilde(request.cwd));
       signal.throwIfAborted();
@@ -86,7 +92,6 @@ export function openResidentCheckoutQueries(options: {
         workspaceGitService: git,
         github,
         checkoutDiffManager: diffs,
-        gitMetadataGenerator,
         ...scope,
         paseoHome,
         worktreesRoot: undefined,
