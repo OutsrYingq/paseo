@@ -177,7 +177,7 @@ const StructuredGenerationProviderConfigSchema = z
   })
   .strict();
 
-const AgentMetadataGenerationSchema = z
+export const AgentMetadataGenerationSchema = z
   .object({
     providers: z.array(StructuredGenerationProviderConfigSchema).optional(),
     instructions: z.string().optional(),

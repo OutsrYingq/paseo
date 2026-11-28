@@ -57,6 +57,8 @@ import { runGitCommand } from "../../../utils/run-git-command.js";
 import { expandTilde } from "../../../utils/path.js";
 import { listGitWorktrees } from "../../../utils/worktree.js";
 import type { GitMetadataGenerator } from "./git-metadata-generator.js";
+import type { CheckoutAction } from "./checkout-actions-protocol.js";
+import { subscribeLegacyCheckoutDiff } from "./legacy-checkout-diff.js";
 
 /**
  * The collaborators a checkout command reaches that are NOT part of the checkout
@@ -127,111 +129,42 @@ export interface CheckoutSessionOptions {
   workspaceGitService: WorkspaceGitService;
   github: ForgeService;
   checkoutDiffManager: CheckoutDiffSubscriber;
-  gitMetadataGenerator: GitMetadataGenerator;
+  gitMetadataGenerator?: GitMetadataGenerator;
+  validateMergeTarget?(cwd: string): Promise<void>;
+  validatePushRemote?(cwd: string, remote: string): Promise<void>;
   paseoHome: string;
   worktreesRoot: string | undefined;
   logger: pino.Logger;
 }
 
-/**
- * A client's checkout view, both sides: the read & live-stream side (status
- * queries, branch validation/suggestions, manual refresh, live git-diff and
- * checkout-status subscriptions) and the command side (switch/rename/commit/
- * merge/pull/push/stash and the GitHub-PR operations).
- *
- * Command operations keep the live diff in sync by calling scheduleDiffRefresh()
- * and refresh the workspace git snapshot through gitMutation.notifyGitMutation(); the
- * workspace git observer streams branch changes through emitStatusUpdate().
- */
-export class CheckoutSession {
-  private static readonly PASEO_STASH_PREFIX = "paseo-auto-stash:";
+export class CheckoutQuerySession {
+  constructor(
+    private readonly host: Pick<CheckoutSessionHost, "emit">,
+    private readonly workspaceGitService: Pick<
+      WorkspaceGitService,
+      "getSnapshot" | "validateBranchRef" | "suggestBranchesForCwd"
+    >,
+    private readonly checkoutDiffManager: Pick<CheckoutDiffSubscriber, "read" | "readCommitFile">,
+    private readonly paseoHome: string,
+    private readonly worktreesRoot: string | undefined,
+  ) {}
 
-  private readonly host: CheckoutSessionHost;
-  private readonly gitMutation: Pick<
-    GitMutationService,
-    "checkoutExistingBranch" | "notifyGitMutation"
-  >;
-  private readonly workspaceGitService: WorkspaceGitService;
-  private readonly github: ForgeService;
-  private readonly checkoutDiffManager: CheckoutDiffSubscriber;
-  private readonly gitMetadataGenerator: GitMetadataGenerator;
-  private readonly paseoHome: string;
-  private readonly worktreesRoot: string | undefined;
-  private readonly logger: pino.Logger;
-  private readonly statusUpdateFingerprints = new Map<string, string>();
-
-  constructor(options: CheckoutSessionOptions) {
-    this.host = options.host;
-    this.gitMutation = options.gitMutation;
-    this.workspaceGitService = options.workspaceGitService;
-    this.github = options.github;
-    this.checkoutDiffManager = options.checkoutDiffManager;
-    this.gitMetadataGenerator = options.gitMetadataGenerator;
-    this.paseoHome = options.paseoHome;
-    this.worktreesRoot = options.worktreesRoot;
-    this.logger = options.logger;
-  }
-
-  private async resolveForgeService(
-    cwd: string,
-  ): Promise<{ forge: string; service: ForgeService } | null> {
-    const resolution = await this.workspaceGitService.resolveForge(cwd);
-    if (!resolution) {
-      return null;
-    }
-    return { forge: resolution.forge, service: resolution.service };
-  }
-
-  private async requireForgeService(
-    cwd: string,
-  ): Promise<{ forge: string; service: ForgeService }> {
-    const resolution = await this.resolveForgeService(cwd);
-    if (!resolution) {
-      throw new NoResolvedForgeServiceError(cwd);
-    }
-    return resolution;
-  }
-
-  private async resolveForgeIdForError(cwd: string): Promise<string> {
-    try {
-      return (await this.workspaceGitService.resolveForge(cwd))?.forge ?? "github";
-    } catch {
-      return "github";
-    }
-  }
-
-  private async resolveAuthStateForError(cwd: string, error: unknown): Promise<ForgeAuthState> {
-    if (error instanceof NoResolvedForgeServiceError) {
-      return error.authState;
-    }
-    try {
-      return (await this.workspaceGitService.resolveForge(cwd)) ? "error" : "no_remote";
-    } catch {
-      return "error";
-    }
-  }
-
-  /**
-   * Combines resolveForgeIdForError + resolveAuthStateForError into a single
-   * resolveForge(cwd) call for the (common) case where the failure isn't a
-   * NoResolvedForgeServiceError — both helpers otherwise resolve the same cwd
-   * independently in the same error path.
-   */
-  private async resolveForgeContextForError(
-    cwd: string,
-    error: unknown,
-  ): Promise<{ forge: string; authState: ForgeAuthState }> {
-    if (error instanceof NoResolvedForgeServiceError) {
-      return { forge: await this.resolveForgeIdForError(cwd), authState: error.authState };
-    }
-    try {
-      const resolution = await this.workspaceGitService.resolveForge(cwd);
-      return {
-        forge: resolution?.forge ?? "github",
-        authState: resolution ? "error" : "no_remote",
-      };
-    } catch {
-      return { forge: "github", authState: "error" };
+  dispatch(message: SessionInboundMessage, signal: AbortSignal): Promise<void> | undefined {
+    switch (message.type) {
+      case "checkout_status_request":
+        return this.handleStatusRequest(message);
+      case "checkout.commits.list.request":
+        return this.handleCommitsListRequest(message);
+      case "checkout.worktrees.list.request":
+        return this.handleWorktreesListRequest(message);
+      case "checkout.commits.file_diff.request":
+        return this.handleCommitFileDiffRequest(message, signal);
+      case "validate_branch_request":
+        return this.handleValidateBranchRequest(message);
+      case "branch_suggestions_request":
+        return this.handleBranchSuggestionsRequest(message);
+      case "checkout.diff.get.request":
+        return this.handleReadDiffRequest(message);
     }
   }
 
@@ -446,58 +379,130 @@ export class CheckoutSession {
       payload: { ...snapshot, requestId: msg.requestId },
     });
   }
+}
 
-  async handleSubscribeDiffRequest(
+/**
+ * A client's checkout view, both sides: the read & live-stream side (status
+ * queries, branch validation/suggestions, manual refresh, live git-diff and
+ * checkout-status subscriptions) and the command side (switch/rename/commit/
+ * merge/pull/push/stash and the GitHub-PR operations).
+ *
+ * Command operations keep the live diff in sync by calling scheduleDiffRefresh()
+ * and refresh the workspace git snapshot through gitMutation.notifyGitMutation(); the
+ * workspace git observer streams branch changes through emitStatusUpdate().
+ */
+export class CheckoutSession {
+  readonly queries: CheckoutQuerySession;
+  private static readonly PASEO_STASH_PREFIX = "paseo-auto-stash:";
+
+  private readonly host: CheckoutSessionHost;
+  private readonly gitMutation: Pick<
+    GitMutationService,
+    "checkoutExistingBranch" | "notifyGitMutation"
+  >;
+  private readonly workspaceGitService: WorkspaceGitService;
+  private readonly github: ForgeService;
+  private readonly checkoutDiffManager: CheckoutDiffSubscriber;
+  private readonly gitMetadataGenerator: GitMetadataGenerator | undefined;
+  private readonly validateMergeTarget: CheckoutSessionOptions["validateMergeTarget"];
+  private readonly validatePushRemote: CheckoutSessionOptions["validatePushRemote"];
+  private readonly paseoHome: string;
+  private readonly worktreesRoot: string | undefined;
+  private readonly logger: pino.Logger;
+  private readonly statusUpdateFingerprints = new Map<string, string>();
+
+  constructor(options: CheckoutSessionOptions) {
+    this.host = options.host;
+    this.gitMutation = options.gitMutation;
+    this.workspaceGitService = options.workspaceGitService;
+    this.github = options.github;
+    this.checkoutDiffManager = options.checkoutDiffManager;
+    this.gitMetadataGenerator = options.gitMetadataGenerator;
+    this.validateMergeTarget = options.validateMergeTarget;
+    this.validatePushRemote = options.validatePushRemote;
+    this.paseoHome = options.paseoHome;
+    this.worktreesRoot = options.worktreesRoot;
+    this.logger = options.logger;
+    this.queries = new CheckoutQuerySession(
+      options.host,
+      options.workspaceGitService,
+      options.checkoutDiffManager,
+      options.paseoHome,
+      options.worktreesRoot,
+    );
+  }
+
+  private async resolveForgeService(
+    cwd: string,
+  ): Promise<{ forge: string; service: ForgeService } | null> {
+    const resolution = await this.workspaceGitService.resolveForge(cwd);
+    if (!resolution) {
+      return null;
+    }
+    return { forge: resolution.forge, service: resolution.service };
+  }
+
+  private async requireForgeService(
+    cwd: string,
+  ): Promise<{ forge: string; service: ForgeService }> {
+    const resolution = await this.resolveForgeService(cwd);
+    if (!resolution) {
+      throw new NoResolvedForgeServiceError(cwd);
+    }
+    return resolution;
+  }
+
+  private async resolveForgeIdForError(cwd: string): Promise<string> {
+    try {
+      return (await this.workspaceGitService.resolveForge(cwd))?.forge ?? "github";
+    } catch {
+      return "github";
+    }
+  }
+
+  private async resolveAuthStateForError(cwd: string, error: unknown): Promise<ForgeAuthState> {
+    if (error instanceof NoResolvedForgeServiceError) {
+      return error.authState;
+    }
+    try {
+      return (await this.workspaceGitService.resolveForge(cwd)) ? "error" : "no_remote";
+    } catch {
+      return "error";
+    }
+  }
+
+  /**
+   * Combines resolveForgeIdForError + resolveAuthStateForError into a single
+   * resolveForge(cwd) call for the (common) case where the failure isn't a
+   * NoResolvedForgeServiceError — both helpers otherwise resolve the same cwd
+   * independently in the same error path.
+   */
+  private async resolveForgeContextForError(
+    cwd: string,
+    error: unknown,
+  ): Promise<{ forge: string; authState: ForgeAuthState }> {
+    if (error instanceof NoResolvedForgeServiceError) {
+      return { forge: await this.resolveForgeIdForError(cwd), authState: error.authState };
+    }
+    try {
+      const resolution = await this.workspaceGitService.resolveForge(cwd);
+      return {
+        forge: resolution?.forge ?? "github",
+        authState: resolution ? "error" : "no_remote",
+      };
+    } catch {
+      return { forge: "github", authState: "error" };
+    }
+  }
+
+
+  handleSubscribeDiffRequest(
     msg: SubscribeCheckoutDiffRequest,
     ownership: SessionDelivery,
   ): Promise<void> {
-    let bootstrap: Promise<CheckoutDiffSubscription> | undefined;
-    const owner = ownership.begin(
-      "diffs",
-      msg.subscriptionId,
-      async () => {
-        await bootstrap?.then(
-          (subscription) => subscription.unsubscribe(),
-          () => undefined,
-        );
-      },
-      `diff:${msg.subscriptionId}`,
+    return subscribeLegacyCheckoutDiff(msg, ownership, this.checkoutDiffManager, (message) =>
+      this.host.emit(message),
     );
-    let ready = false;
-    let pending: CheckoutDiffSnapshotPayload | null = null;
-    const emitSnapshot = (snapshot: CheckoutDiffSnapshotPayload) =>
-      owner.emit({
-        type: "checkout_diff_update",
-        payload: { ...snapshot, subscriptionId: owner.responseId },
-      });
-    try {
-      bootstrap = this.checkoutDiffManager.subscribe(
-        { cwd: expandTilde(msg.cwd), compare: msg.compare, signal: owner.signal },
-        (snapshot) => {
-          if (owner.signal.aborted) return;
-          if (ready) emitSnapshot(snapshot);
-          else pending = snapshot;
-        },
-      );
-      const subscription = await bootstrap;
-      if (owner.signal.aborted) {
-        subscription.unsubscribe();
-        return;
-      }
-      this.host.emit({
-        type: "subscribe_checkout_diff_response",
-        payload: {
-          ...subscription.initial,
-          subscriptionId: owner.responseId,
-          requestId: msg.requestId,
-        },
-      });
-      ready = true;
-      if (pending) emitSnapshot(pending);
-    } catch (error) {
-      await owner.release();
-      throw error;
-    }
   }
 
   async handleUnsubscribeDiffRequest(
@@ -583,6 +588,52 @@ export class CheckoutSession {
   // ---------------------------------------------------------------------------
   // Command operations (writes) and GitHub-PR operations
   // ---------------------------------------------------------------------------
+
+  dispatchAction(message: CheckoutAction): Promise<void> {
+    switch (message.type) {
+      case "checkout_switch_branch_request":
+        return this.handleCheckoutSwitchBranchRequest(message);
+      case "checkout.rename_branch.request":
+        return this.handleCheckoutRenameBranchRequest(message);
+      case "checkout.refresh.request":
+        return this.handleRefreshRequest(message);
+      case "checkout.discard_changes.request":
+        return this.handleCheckoutDiscardChangesRequest(message);
+      case "stash_save_request":
+        return this.handleStashSaveRequest(message);
+      case "stash_pop_request":
+        return this.handleStashPopRequest(message);
+      case "stash_list_request":
+        return this.handleStashListRequest(message);
+      case "checkout_commit_request":
+        return this.handleCheckoutCommitRequest(message);
+      case "checkout_merge_request":
+        return this.handleCheckoutMergeRequest(message);
+      case "checkout_merge_from_base_request":
+        return this.handleCheckoutMergeFromBaseRequest(message);
+      case "checkout_pull_request":
+        return this.handleCheckoutPullRequest(message);
+      case "checkout_push_request":
+        return this.handleCheckoutPushRequest(message);
+      case "checkout_pr_create_request":
+        return this.handleCheckoutPrCreateRequest(message);
+      case "checkout_pr_merge_request":
+        return this.handleCheckoutPrMergeRequest(message);
+      case "checkout.forge.set_auto_merge.request":
+      case "checkout.github.set_auto_merge.request":
+        return this.handleCheckoutForgeSetAutoMergeRequest(message);
+      case "checkout_pr_status_request":
+        return this.handleCheckoutPrStatusRequest(message);
+      case "pull_request_timeline_request":
+        return this.handlePullRequestTimelineRequest(message);
+      case "checkout.forge.get_check_details.request":
+      case "checkout.github.get_check_details.request":
+        return this.handleCheckoutForgeGetCheckDetailsRequest(message);
+      case "forge.search.request":
+      case "github_search_request":
+        return this.handleForgeSearchRequest(message);
+    }
+  }
 
   async handleCheckoutSwitchBranchRequest(
     msg: Extract<SessionInboundMessage, { type: "checkout_switch_branch_request" }>,
@@ -775,7 +826,7 @@ export class CheckoutSession {
 
     try {
       let message = msg.message?.trim() ?? "";
-      if (!message) {
+      if (!message && this.gitMetadataGenerator) {
         message = await this.gitMetadataGenerator.generateCommitMessage(cwd);
       }
       if (!message) {
@@ -841,6 +892,7 @@ export class CheckoutSession {
         {
           baseRef,
           mode: msg.strategy === "squash" ? "squash" : "merge",
+          validateTarget: this.validateMergeTarget,
         },
         { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot },
       );
@@ -848,7 +900,10 @@ export class CheckoutSession {
         this.gitMutation.notifyGitMutation(mutatedCwd, "merge-to-base", { invalidateForge: true }),
         ...(mutatedCwd !== cwd ? [this.gitMutation.notifyGitMutation(cwd, "merge-to-base")] : []),
       ]);
-      await this.scheduleDiffRefresh(cwd);
+      await Promise.all([
+        this.scheduleDiffRefresh(cwd),
+        ...(mutatedCwd !== cwd ? [this.scheduleDiffRefresh(mutatedCwd)] : []),
+      ]);
 
       this.host.emit({
         type: "checkout_merge_response",
@@ -959,6 +1014,7 @@ export class CheckoutSession {
       await pushCurrentBranch(cwd, undefined, {
         paseoHome: this.paseoHome,
         worktreesRoot: this.worktreesRoot,
+        validatePushRemote: this.validatePushRemote,
       });
       await this.gitMutation.notifyGitMutation(cwd, "push", { invalidateForge: true });
       this.host.emit({
@@ -993,6 +1049,9 @@ export class CheckoutSession {
       let body = msg.body?.trim() ?? "";
 
       if (!title || !body) {
+        if (!this.gitMetadataGenerator) {
+          throw new Error("Pull request title and body are required");
+        }
         const generated = await this.gitMetadataGenerator.generatePullRequestText(cwd, msg.baseRef);
         if (!title) title = generated.title;
         if (!body) body = generated.body;
@@ -1007,7 +1066,11 @@ export class CheckoutSession {
           base: msg.baseRef,
         },
         service,
-        { paseoHome: this.paseoHome, worktreesRoot: this.worktreesRoot },
+        {
+          paseoHome: this.paseoHome,
+          worktreesRoot: this.worktreesRoot,
+          validatePushRemote: this.validatePushRemote,
+        },
       );
       await this.gitMutation.notifyGitMutation(cwd, "create-pr", { invalidateForge: true });
 

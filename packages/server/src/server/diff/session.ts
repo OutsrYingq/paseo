@@ -12,7 +12,7 @@ import type { DiffSubscriptions, DiffSubscription } from "./index.js";
 export class DiffSession {
   private slots = new Set<number>();
   constructor(
-    private subscriptions: DiffSubscriptions,
+    private subscriptions: Pick<DiffSubscriptions, "subscribe">,
     private logger: Pick<Logger, "debug" | "error">,
   ) {}
   async subscribe(

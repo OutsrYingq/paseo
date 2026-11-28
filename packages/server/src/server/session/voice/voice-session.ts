@@ -16,7 +16,6 @@ import {
 import { createVoiceTurnController, type VoiceTurnController } from "./voice-turn-controller.js";
 import { buildVoiceModeSystemPrompt, stripVoiceModeSystemPrompt } from "../../voice-config.js";
 import type { VoiceCallerContext, VoiceSpeakHandler } from "../../voice-types.js";
-import type { ManagedAgent } from "../../agent/agent-manager.js";
 import type { AgentSessionConfig } from "../../agent/agent-sdk-types.js";
 import type { LocalSpeechModelId } from "../../speech/providers/local/models.js";
 import { toResolver, type Resolvable } from "../../speech/provider-resolver.js";
@@ -121,14 +120,15 @@ function convertPCMToWavBuffer(
  */
 export interface VoiceSessionHost {
   emit(msg: SessionOutboundMessage): void;
-  loadAgent(agentId: string): Promise<ManagedAgent>;
+  loadAgent(agentId: string): Promise<{ config: Pick<AgentSessionConfig, "systemPrompt"> }>;
   reloadAgentSession(
     agentId: string,
     overrides: Partial<AgentSessionConfig>,
-  ): Promise<ManagedAgent>;
+    restore?: boolean,
+  ): Promise<{ id: string }>;
   sendSpokenInput(agentId: string, text: string): Promise<void>;
   interruptAgentIfRunning(agentId: string): Promise<void>;
-  hasActiveAgentRun(agentId: string | null): boolean;
+  hasActiveAgentRun(agentId: string | null): boolean | Promise<boolean>;
 }
 
 export interface VoiceSessionOptions {
@@ -539,9 +539,13 @@ export class VoiceSession {
     if (restoreAgentConfig && this.voiceModeBaseConfig) {
       const baseConfig = this.voiceModeBaseConfig;
       try {
-        await this.host.reloadAgentSession(agentId, {
-          systemPrompt: buildVoiceModeSystemPrompt(baseConfig.systemPrompt, false),
-        });
+        await this.host.reloadAgentSession(
+          agentId,
+          {
+            systemPrompt: buildVoiceModeSystemPrompt(baseConfig.systemPrompt, false),
+          },
+          true,
+        );
       } catch (error) {
         this.sessionLogger.warn(
           { err: error, agentId },
@@ -1153,7 +1157,8 @@ export class VoiceSession {
 
     const chunkReceivedAt = Date.now();
     const phaseBeforeAbort = this.processingPhase;
-    const hadActiveStream = this.host.hasActiveAgentRun(this.voiceModeAgentId);
+    const active = this.host.hasActiveAgentRun(this.voiceModeAgentId);
+    const hadActiveStream = typeof active === "boolean" ? active : active.catch(() => false);
 
     this.speechInProgress = true;
     this.sessionLogger.debug("Voice speech detected – aborting playback and active agent run");
@@ -1182,10 +1187,13 @@ export class VoiceSession {
     await this.handleAbort();
 
     const latencyMs = Date.now() - chunkReceivedAt;
-    this.sessionLogger.debug(
-      { latencyMs, phaseBeforeAbort, hadActiveStream },
-      "[Telemetry] barge_in.llm_abort_latency",
-    );
+    const reportLatency = (active: boolean) =>
+      this.sessionLogger.debug(
+        { latencyMs, phaseBeforeAbort, hadActiveStream: active },
+        "[Telemetry] barge_in.llm_abort_latency",
+      );
+    if (typeof hadActiveStream === "boolean") reportLatency(hadActiveStream);
+    else void hadActiveStream.then(reportLatency);
   }
 
   /**

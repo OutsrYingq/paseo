@@ -9,33 +9,27 @@ import {
 } from "@getpaseo/protocol/binary-frames/index";
 import type {
   FileDownloadTokenRequest,
-  FileEntryCreateRequest,
-  FileEntryDeleteRequest,
-  FileEntryDuplicateRequest,
-  FileEntryRenameRequest,
   FileExplorerRequest,
   FileUploadRequest,
   FileSubscribeRequest,
   FileUnsubscribeRequest,
-  FileWriteRequest,
   SessionInboundMessage,
   SessionOutboundMessage,
 } from "../../messages.js";
 import { FileUploadStore } from "../../file-upload/index.js";
 import type { DownloadTokenStore } from "../../file-download/token-store.js";
 import {
-  createExplorerEntry,
-  deleteExplorerEntry,
-  duplicateExplorerEntry,
   getDownloadableFileInfo,
   listDirectoryEntries,
   readExplorerFile,
-  renameExplorerEntry,
   streamExplorerFile,
-  writeExplorerFile,
 } from "../../file-explorer/service.js";
 import { workspaceFileObserver, type FileObserver } from "../../file-explorer/observer.js";
 import { getProjectIcon } from "../../../utils/project-icon.js";
+import {
+  mutateWorkspaceFile,
+  type WorkspaceFileMutation,
+} from "./workspace-file-mutations.js";
 
 /**
  * What a workspace file-access request reaches outside its own domain: the
@@ -57,27 +51,11 @@ export interface WorkspaceFilesSessionOptions {
   fileObserver?: FileObserver;
 }
 
-/**
- * A client's workspace file-access surface: browsing directories, reading file
- * contents (inline JSON or binary frames), receiving uploads, issuing download
- * tokens, and reading project icons. It owns the upload store and reaches no
- * workspace-git, registry, or subscription state — file I/O scoped to a cwd is
- * the whole concern.
- */
-export class WorkspaceFilesSession {
-  private readonly host: WorkspaceFilesSessionHost;
-  private readonly downloadTokenStore: DownloadTokenStore;
-  private readonly logger: pino.Logger;
-  private readonly fileUploads: FileUploadStore;
-  private readonly fileObserver: FileObserver;
-
-  constructor(options: WorkspaceFilesSessionOptions) {
-    this.host = options.host;
-    this.downloadTokenStore = options.downloadTokenStore;
-    this.logger = options.logger;
-    this.fileUploads = new FileUploadStore({ paseoHome: options.paseoHome });
-    this.fileObserver = options.fileObserver ?? workspaceFileObserver;
-  }
+export class WorkspaceFileObservation {
+  constructor(
+    private readonly host: Pick<WorkspaceFilesSessionHost, "emit">,
+    private readonly fileObserver: Pick<FileObserver, "subscribe">,
+  ) {}
 
   async handleFileSubscribeRequest(
     request: FileSubscribeRequest,
@@ -154,94 +132,33 @@ export class WorkspaceFilesSession {
       payload: { subscriptionId: request.subscriptionId, requestId: request.requestId },
     });
   }
+}
 
-  async handleFileWriteRequest(request: FileWriteRequest): Promise<void> {
-    const result = await writeExplorerFile({
-      root: request.cwd,
-      relativePath: request.path,
-      content: request.content,
-      contentEncoding: request.contentEncoding,
-      expectedModifiedAt: request.expectedModifiedAt,
-      expectedRevision: request.expectedRevision,
-    });
-    this.host.emit({
-      type: "fs.file.write.response",
-      payload: { result, requestId: request.requestId },
-    });
+/**
+ * A client's workspace file-access surface: browsing directories, reading file
+ * contents (inline JSON or binary frames), receiving uploads, issuing download
+ * tokens, and reading project icons. It owns the upload store and reaches no
+ * workspace-git, registry, or subscription state — file I/O scoped to a cwd is
+ * the whole concern.
+ */
+export class WorkspaceFilesSession {
+  private readonly host: WorkspaceFilesSessionHost;
+  private readonly downloadTokenStore: DownloadTokenStore;
+  private readonly logger: pino.Logger;
+  private readonly fileUploads: FileUploadStore;
+  readonly observation: WorkspaceFileObservation;
+
+  constructor(options: WorkspaceFilesSessionOptions) {
+    this.host = options.host;
+    this.downloadTokenStore = options.downloadTokenStore;
+    this.logger = options.logger;
+    this.fileUploads = new FileUploadStore({ paseoHome: options.paseoHome });
+    this.observation = new WorkspaceFileObservation(this.host, options.fileObserver ?? workspaceFileObserver);
   }
 
-  async handleFileEntryCreateRequest(request: FileEntryCreateRequest): Promise<void> {
-    const result = await createExplorerEntry({
-      root: request.cwd,
-      parentPath: request.parentPath,
-      name: request.name,
-      kind: request.kind,
-    });
-    this.host.emit({
-      type: "fs.entry.create.response",
-      payload: {
-        cwd: request.cwd,
-        parentPath: request.parentPath,
-        path: result.status === "ok" ? result.path : null,
-        success: result.status === "ok",
-        error: result.status === "ok" ? null : result.error,
-        requestId: request.requestId,
-      },
-    });
-  }
 
-  async handleFileEntryRenameRequest(request: FileEntryRenameRequest): Promise<void> {
-    const result = await renameExplorerEntry({
-      root: request.cwd,
-      relativePath: request.path,
-      name: request.name,
-    });
-    this.host.emit({
-      type: "fs.entry.rename.response",
-      payload: {
-        cwd: request.cwd,
-        path: request.path,
-        renamedPath: result.status === "ok" ? result.path : null,
-        success: result.status === "ok",
-        error: result.status === "ok" ? null : result.error,
-        requestId: request.requestId,
-      },
-    });
-  }
-
-  async handleFileEntryDuplicateRequest(request: FileEntryDuplicateRequest): Promise<void> {
-    const result = await duplicateExplorerEntry({
-      root: request.cwd,
-      relativePath: request.path,
-    });
-    this.host.emit({
-      type: "fs.entry.duplicate.response",
-      payload: {
-        cwd: request.cwd,
-        path: request.path,
-        duplicatedPath: result.status === "ok" ? result.path : null,
-        success: result.status === "ok",
-        error: result.status === "ok" ? null : result.error,
-        requestId: request.requestId,
-      },
-    });
-  }
-
-  async handleFileEntryDeleteRequest(request: FileEntryDeleteRequest): Promise<void> {
-    const result = await deleteExplorerEntry({
-      root: request.cwd,
-      relativePath: request.path,
-    });
-    this.host.emit({
-      type: "fs.entry.delete.response",
-      payload: {
-        cwd: request.cwd,
-        path: request.path,
-        success: result.status === "ok",
-        error: result.status === "ok" ? null : result.error,
-        requestId: request.requestId,
-      },
-    });
+  async handleFileMutation(request: WorkspaceFileMutation): Promise<void> {
+    this.host.emit(await mutateWorkspaceFile(request));
   }
 
   async handleFileExplorerRequest(request: FileExplorerRequest, source?: object): Promise<void> {

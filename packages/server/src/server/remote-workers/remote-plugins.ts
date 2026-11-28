@@ -4,9 +4,11 @@ import { isDeepStrictEqual } from "node:util";
 import path from "node:path";
 import type pino from "pino";
 import { MutableDaemonConfigSchema, type PluginListItem } from "@getpaseo/protocol/messages";
+import { formatPluginSourceReference } from "@getpaseo/protocol/plugin-source-reference";
 import type {
   ProviderConnection,
   ProviderEvent,
+  ProviderLaunch,
   ProviderInput,
   ProviderPersistence,
   ProviderRegistration,
@@ -17,9 +19,14 @@ import {
   createProviderEnv,
   type AgentProviderRuntimeSettingsMap,
 } from "../agent/provider-launch-config.js";
+import type { AgentUsageSession } from "../agent/agent-sdk-types.js";
 import { DaemonConfigStore } from "../daemon-config-store.js";
 import { loadPersistedConfig } from "../persisted-config.js";
 import { PluginService } from "../plugins/index.js";
+import type { ValidatedPluginNotification } from "../plugins/notifications.js";
+import { ManagedPluginSources } from "../plugins/managed-source.js";
+import { BuiltinPluginLoader, builtinPlugins } from "../plugins/builtin/index.js";
+import type { AgentUsageLookup } from "../plugins/usage-sources/index.js";
 import { PluginRuntime } from "../plugins/runtime.js";
 import type { PluginRuntimeSubscription } from "../plugins/runtime-subscription.js";
 import type { PluginSessionSocket } from "../plugins/session-socket.js";
@@ -53,6 +60,9 @@ interface ResidentPluginHostOptions {
   daemonVersion: string;
   logger: pino.Logger;
   providerSettings?: AgentProviderRuntimeSettingsMap;
+  configStore?: DaemonConfigStore;
+  builtinPlugins?: BuiltinPluginLoader;
+  nativeUsage?: Pick<AgentUsageLookup, "usageSession" | "resolveLaunch" | "isProviderActive">;
 }
 
 interface ResidentPluginChannelOptions {
@@ -76,11 +86,12 @@ export function createResidentPluginHost(options: ResidentPluginHostOptions) {
   const scope = { ...options.scope };
   const logger = options.logger.child({ workerId: scope.workerId, podUid: scope.podUid });
   const persisted = loadPersistedConfig(options.paseoHome, logger);
-  const config = new DaemonConfigStore(
+  const config = options.configStore ?? new DaemonConfigStore(
     options.paseoHome,
     MutableDaemonConfigSchema.parse({
       mcp: { injectIntoAgents: false },
       pluginsEnabled: persisted.pluginsEnabled,
+      usage: { enabled: persisted.daemon?.usage?.enabled !== false },
       plugins: persisted.plugins,
     }),
     logger,
@@ -90,8 +101,36 @@ export function createResidentPluginHost(options: ResidentPluginHostOptions) {
     settingsDirectory: path.join(options.paseoHome, "plugin-settings"),
     onSettingsChanged: (id, settingsId) => channel?.notifySettings(id, settingsId),
   });
-  const service = new PluginService(logger, config, options.daemonVersion, { runtime });
   const workers = new Set<ResidentProviderConnection>();
+  function usageSession(id: string): AgentUsageSession | null {
+    for (const worker of workers) {
+      const session = worker.usageSession(id);
+      if (session) return session;
+    }
+    return options.nativeUsage?.usageSession(id) ?? null;
+  }
+  const service = new PluginService(logger, config, options.daemonVersion, {
+    runtime,
+    builtinPlugins:
+      options.builtinPlugins ??
+      new BuiltinPluginLoader(undefined, builtinPlugins.filter((id) => id.endsWith("-usage-source"))),
+    usageAgents: {
+      hasAgent: (id) => usageSession(id) !== null,
+      usageSession,
+      async resolveLaunch(id) {
+        const registration = service.getProviderRegistrations().find((entry) => entry.id === id);
+        return registration ? providerLaunch(registration) : options.nativeUsage?.resolveLaunch?.(id);
+      },
+      async isProviderActive(id, refresh) {
+        if (service.getProviderRegistrations().some((entry) => entry.id === id)) return true;
+        return await options.nativeUsage?.isProviderActive?.(id, refresh) ?? false;
+      },
+    },
+    managedSources: new ManagedPluginSources(options.paseoHome, {
+      registries: persisted.pluginRegistries,
+      defaultUrl: process.env.PASEO_PLUGIN_REGISTRY,
+    }),
+  });
   const reloading = new Set<string>();
   const sessions = new Map<
     string,
@@ -106,6 +145,7 @@ export function createResidentPluginHost(options: ResidentPluginHostOptions) {
         attach(id: string, pluginId: string): void;
         forward(id: string, data: string | Uint8Array): void;
         notifySettings(id: string, settingsId: string): void;
+        notifyPlugin(notification: ValidatedPluginNotification): void;
         close(): Promise<void>;
       }
     | undefined;
@@ -132,6 +172,9 @@ export function createResidentPluginHost(options: ResidentPluginHostOptions) {
   }
 
   service.bindPaseoSessionHost({
+    sendPluginNotification(notification) {
+      channel?.notifyPlugin(notification);
+    },
     async attachPluginSocket(pluginId, socket) {
       if (closing) throw new Error("worker_plugins_closed");
       const id = randomUUID();
@@ -243,18 +286,74 @@ export function createResidentPluginHost(options: ResidentPluginHostOptions) {
         await started;
         requireActive();
       }
-      const value = await dispatch(request);
+      let sourceRequest: Promise<unknown> | undefined;
+      let sourceValue: unknown;
+      try {
+        sourceRequest = dispatchSource(request);
+        if (sourceRequest) sourceValue = await sourceRequest;
+      } catch (error) {
+        return RemotePluginResultSchema.parse({
+          action: request.action,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      const value = sourceRequest ? sourceValue : await dispatch(request);
       return RemotePluginResultSchema.parse({ action: request.action, value });
+    }
+
+    function dispatchSource(request: RemotePluginAction): Promise<unknown> | undefined {
+      switch (request.action) {
+        case "usageReports":
+          if (config.get().usage?.enabled === false) throw new Error("Usage is off on this host.");
+          return service.listUsageReports({
+            agentId: request.sessionId,
+            forceRefresh: request.forceRefresh,
+            reportIds: request.reportIds,
+            onReport: (report) => publish({ type: "usageReport", queryId: request.queryId, report }),
+          });
+        case "usageLegacy":
+          if (config.get().usage?.enabled === false) throw new Error("Usage is off on this host.");
+          return service.listLegacyUsage();
+        case "inspectDirectory":
+          return service.inspectDirectory(request.path).then(({ id }) => ({ id }));
+        case "installSource":
+          return service
+            .installSource({
+              // COMPAT(plugin-source-path): accepted for v0.7 clients; remove after 2027-09-01.
+              source: formatPluginSourceReference(request.source, request.pluginPath),
+              id: request.id,
+              ref: request.ref,
+            })
+            .then(listItem);
+        case "statusSources":
+          return service.statusSources(request.pluginId);
+        case "updateSources":
+          return service.updateSources(request.pluginId);
+        case "previewUpdates":
+          return service.previewUpdates(request);
+        case "applyUpdates": {
+          const previousWorkers = [...workers];
+          return service.applyUpdates(request.proposals).then((results) => {
+            for (const { id, outcome } of results) {
+              if (outcome !== "updated") continue;
+              for (const entry of previousWorkers) if (entry.pluginId === id) entry.retire();
+            }
+            return results;
+          });
+        }
+        case "listRegistry":
+          return service.listRegistry();
+        case "getRegistryPlugin":
+          return service.getRegistryPlugin(request.id);
+        default:
+          return undefined;
+      }
     }
 
     async function dispatch(request: RemotePluginAction): Promise<unknown> {
       switch (request.action) {
         case "list":
           return (await service.listPlugins()).map(listItem);
-        case "inspectDirectory": {
-          const { id } = await service.inspectDirectory(request.path);
-          return { id };
-        }
         case "installDirectory":
           return listItem(await service.installDirectory(request));
         case "logs":
@@ -381,8 +480,9 @@ export function createResidentPluginHost(options: ResidentPluginHostOptions) {
             )?.id;
           if (!pluginId || reloading.has(pluginId))
             throw new RemotePluginOperationError("worker_plugin_reloading");
+          let usageLaunch: ProviderLaunch | undefined;
           const connection = (async () => {
-            const launch = await providerLaunch(provider);
+            const launch = usageLaunch = await providerLaunch(provider);
             requireActive();
             if (reloading.has(pluginId) || requireProvider(request.token) !== provider)
               throw new Error("unknown_worker_plugin_provider");
@@ -393,6 +493,7 @@ export function createResidentPluginHost(options: ResidentPluginHostOptions) {
             providerId: provider.id,
             owner,
             connection,
+            usageLaunch: () => usageLaunch,
             workers,
             publish: (value) => publish({ type: "providerEvent", connectionId, value }),
             onRetire: () => {
@@ -490,6 +591,9 @@ export function createResidentPluginHost(options: ResidentPluginHostOptions) {
       notifySettings(id: string, settingsId: string) {
         publish({ type: "settingsChanged", plugin: pluginRef(id), settingsId });
       },
+      notifyPlugin(notification: ValidatedPluginNotification) {
+        publish({ type: "pluginNotification", notification });
+      },
       close: closeChannel,
     };
     channel = current;
@@ -521,6 +625,7 @@ function isHelloFrame(data: string): boolean {
 
 interface WorkerPluginSession {
   cwd: string;
+  model?: string;
   opening?: string;
   closing?: string;
   persistence?: ProviderPersistence;
@@ -534,6 +639,7 @@ interface ResidentProviderConnectionOptions {
   providerId: string;
   owner: symbol;
   connection: Promise<ProviderConnection>;
+  usageLaunch(): ProviderLaunch | undefined;
   workers: Set<ResidentProviderConnection>;
   publish?(event: ProviderEvent): void;
   onRetire?(): void;
@@ -564,6 +670,24 @@ class ResidentProviderConnection {
 
   get pluginId() {
     return this.options.pluginId;
+  }
+
+  usageSession(id: string): AgentUsageSession | null {
+    const launch = this.options.usageLaunch();
+    if (!launch || this.detached || this.stopped) return null;
+    for (const [sessionId, session] of this.sessions) {
+      if (session.opening || session.closing) continue;
+      if (sessionId === id || (session.persistence && `plugin:${JSON.stringify(session.persistence)}` === id)) {
+        return {
+          provider: this.options.providerId,
+          model: session.model,
+          env: launch.env,
+          launch,
+          sessionKey: sessionId,
+        };
+      }
+    }
+    return null;
   }
 
   async send(input: ProviderInput) {
@@ -608,6 +732,7 @@ class ResidentProviderConnection {
     }
     this.sessions.set(input.sessionId, {
       cwd,
+      model: input.config.model,
       opening: input.requestId,
       persistence: input.persistence,
       prompts: new Set(),

@@ -11,9 +11,14 @@ import {
 } from "./session/workspace-base-branch/service.js";
 import type { WorkspaceBaseBranchSetRequest } from "@getpaseo/protocol/messages";
 
-import { searchTimeline } from "./agent/chat-search/index.js";
+import {
+  handleAgentOrchestrationRequest,
+  projectProviderSubagentUpdate,
+  readBackgroundWorkUpdate,
+} from "./session/agent-history/agent-orchestration.js";
+import { queryAgentTimeline } from "./session/agent-history/timeline-query.js";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
-import { BrowserAutomationHostCapabilitySchema } from "@getpaseo/protocol/browser-automation/capabilities";
+import { BrowserToolsSession } from "./browser-tools/session.js";
 import type {
   SessionEventSubscription,
   UsageReportEntry,
@@ -28,10 +33,6 @@ import type {
   AgentCreateRequest,
 } from "@getpaseo/protocol/messages";
 import type { MessageReceipts } from "./message-receipts/index.js";
-import {
-  isDaemonBackgroundWorkItem,
-  type AgentBackgroundWorkItem,
-} from "./agent/background-work/index.js";
 import equal from "fast-deep-equal";
 import { WorkspaceSetupObservation } from "./workspace-setup-observation.js";
 import { SessionDelivery, type OwnedSubscription } from "./session/owned-subscriptions/index.js";
@@ -84,6 +85,7 @@ import {
   toAgentPersistenceHandle,
 } from "./persistence-hooks.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent/agent-loading.js";
+import { listAgentCommands } from "./session/agent-config/list-agent-commands.js";
 import {
   sendPromptToAgent,
   waitForAgentRunStartWithTimeout,
@@ -107,7 +109,7 @@ import { releaseWorkspaceServicePortPlan } from "./workspace-service-port-regist
 import { getErrorMessage, getErrorMessageOr } from "@getpaseo/protocol/error-utils";
 import { createAgentDirectoryPager } from "./agent/directory-pager.js";
 import { getParentAgentIdFromLabels } from "@getpaseo/protocol/agent-labels";
-import { applyRecordPatch } from "./record-patch.js";
+import { changeWorkspaceSettings } from "./session/workspace-provisioning/workspace-settings.js";
 import type { WorkspaceGitRuntimeSnapshot, WorkspaceGitService } from "./workspace-git-service.js";
 import type { ProjectUpdate } from "./workspace-reconciliation-service.js";
 import {
@@ -121,14 +123,13 @@ import {
   formatWorkspaceAutomationBlockedMessage,
   isCheckoutUntrusted,
 } from "./workspace-automation-gate.js";
+import type { WorkspaceLabelService } from "./workspace-labels/index.js";
 import {
-  WorkspaceLabelError,
-  WorkspaceLabelStorageUncertainError,
-  type WorkspaceLabelService,
-} from "./workspace-labels/index.js";
+  handleWorkspaceLabelRequest,
+  isWorkspaceLabelRequest,
+} from "./session/workspace-labels/label-session.js";
 
 import { AgentManager, AgentRunCancellationError } from "./agent/agent-manager.js";
-import { buildTimelinePromptIndex } from "./agent/timeline-prompt-index.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type {
   AgentManagerEvent,
@@ -323,7 +324,7 @@ function resolveWorkspaceArchiveOperations(
   return operations ?? new WorkspaceArchiveOperations();
 }
 import { WorktreeRequestError, toWorktreeWireError } from "./worktree-errors.js";
-import { parseGitRemoteLocation } from "@getpaseo/protocol/git-remote";
+import { normalizeCloneRepository } from "./project-github.js";
 import {
   createProjectDirectory,
   ProjectDirectoryRequestError,
@@ -739,17 +740,6 @@ function hasInitialCreationPrompt(
   );
 }
 
-function workspaceLabelErrorCode(error: unknown): string {
-  if (
-    error instanceof WorkspaceLabelError ||
-    error instanceof WorkspaceLabelStorageUncertainError ||
-    error instanceof SessionRequestError
-  ) {
-    return error.code;
-  }
-  return "workspace_label_failed";
-}
-
 interface ClientActivity {
   deviceType: "web" | "mobile";
   focusedAgentId: string | null;
@@ -808,7 +798,7 @@ export class Session {
         "Unrecognized reply contract; application delivery denied",
       ),
   );
-  private readonly browserToolsBroker: SessionOptions["browserToolsBroker"];
+  private readonly browserTools: BrowserToolsSession;
   private readonly createNetworkTunnelTicket: SessionOptions["createNetworkTunnelTicket"];
   private readonly clientId: string;
   private readonly authorization: SessionAuthorization;
@@ -989,7 +979,7 @@ export class Session {
       daemonRuntimeConfig,
       getWebSocketRuntimeMetrics,
     } = options;
-    this.browserToolsBroker = options.browserToolsBroker;
+    this.browserTools = new BrowserToolsSession(options.browserToolsBroker, this.delivery);
     this.createNetworkTunnelTicket = createNetworkTunnelTicket;
     this.clientId = clientId;
     this.authorization = new SessionAuthorization(permissions);
@@ -1478,26 +1468,10 @@ export class Session {
       });
       this.refreshObservationProducers();
       // COMPAT(ownedSubscriptions): added in v0.8.0, remove capability-driven legacy host registration after 2027-03-09.
-      if (
-        !this.delivery.isModern(source) &&
-        this.authorization.allowsPermission("workspace.write")
-      ) {
-        const host = BrowserAutomationHostCapabilitySchema.safeParse(capabilities?.browser_host);
-        if (host.success && this.browserToolsBroker) {
-          const request = {
-            type: "browser.host.register.request" as const,
-            requestId: uuidv4(),
-            hostKind: host.data.hostKind,
-            label: host.data.label,
-            instanceId: host.data.instanceId,
-            supportedCommands: host.data.supportedCommands,
-          };
-          void this.delivery
-            .request(source, request, () => this.registerBrowserHost(request, false))
-            .catch((error) =>
-              this.sessionLogger.warn({ err: error }, "Failed to register legacy browser host"),
-            );
-        }
+      if (this.authorization.allowsPermission("workspace.write")) {
+        void this.browserTools.registerLegacy(source, capabilities?.browser_host)?.catch((error) =>
+          this.sessionLogger.warn({ err: error }, "Failed to register legacy browser host"),
+        );
       }
     }
   }
@@ -2152,68 +2126,26 @@ export class Session {
     }
   }
 
-  private supportsSubagentTimelineItem(
-    item: AgentTimelineFetchResult["rows"][number]["item"],
-    source?: object,
-  ): boolean {
-    // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove gate after 2027-03-14.
-    const supportsProjection = source
-      ? this.supportsForSource(CLIENT_CAPS.projectedSubagentTimeline, source)
-      : this.supports(CLIENT_CAPS.projectedSubagentTimeline);
-    return supportsProjection && this.supportsTimelineItem(item, source);
-  }
-
-  private forwardProviderSubagentUpdate(
-    update: Extract<AgentManagerEvent, { type: "provider_subagent" }>["event"],
-  ): void {
-    let message: SessionOutboundMessage;
-    if (update.type === "upsert") {
-      message = {
-        type: "agent.provider_subagents.update",
-        payload: { kind: "upsert", subagent: update.subagent },
-      };
-    } else if (update.type === "timeline") {
-      message = {
-        type: "agent.provider_subagents.update",
-        payload: {
-          kind: "timeline",
-          parentAgentId: update.parentAgentId,
-          subagentId: update.subagentId,
-          provider: update.provider,
-          item: update.row.item,
-          timestamp: update.row.timestamp,
-          seq: update.row.seq,
-          epoch: update.epoch,
-        },
-      };
-    } else {
-      message = {
-        type: "agent.provider_subagents.update",
-        payload: {
-          kind: "remove",
-          parentAgentId: update.parentAgentId,
-          subagentId: update.subagentId,
-        },
-      };
-    }
-
+  private forwardProviderSubagentUpdate(event: ProviderSubagentManagerEvent): void {
+    const project = (source?: object) =>
+      projectProviderSubagentUpdate({
+        agentManager: this.agentManager,
+        event,
+        supports: (capability) =>
+          source ? this.supportsForSource(capability, source) : this.supports(capability),
+      });
     const delivered = new Set<object>();
     for (const subscription of this.eventSubscriptions.values()) {
       if (!subscription.events.has("agent.provider_subagents.update")) continue;
-      if (
-        update.type === "timeline" &&
-        !this.supportsSubagentTimelineItem(update.row.item, subscription.owner.source)
-      )
-        continue;
+      const message = project(subscription.owner.source);
+      if (!message) continue;
       subscription.owner.emit(message);
       delivered.add(subscription.owner.source);
     }
     if (this.clientSources.size === 0 || !this.onMessageToSource) {
-      if (
-        this.supports(CLIENT_CAPS.providerSubagents) &&
-        (update.type !== "timeline" || this.supportsSubagentTimelineItem(update.row.item))
-      ) {
-        this.emit(message);
+      if (this.supports(CLIENT_CAPS.providerSubagents)) {
+        const message = project();
+        if (message) this.emit(message);
       }
       return;
     }
@@ -2224,9 +2156,8 @@ export class Session {
         !capabilities.has(CLIENT_CAPS.providerSubagents)
       )
         continue;
-      if (update.type === "timeline" && !this.supportsSubagentTimelineItem(update.row.item, source))
-        continue;
-      this.onMessageToSource(source, message);
+      const message = project(source);
+      if (message) this.onMessageToSource(source, message);
     }
   }
 
@@ -2362,41 +2293,24 @@ export class Session {
   }
 
   private forwardProviderSubagent(event: ProviderSubagentManagerEvent): void {
-    const parentAgentId =
-      event.type === "upsert" ? event.subagent.parentAgentId : event.parentAgentId;
-    if (this.agentManager.getAgent(parentAgentId)?.internal) return;
     this.emitProviderSubagentWorkspaceUpdate(event);
     this.forwardProviderSubagentUpdate(event);
   }
 
   private async forwardBackgroundWork(agentId: string): Promise<void> {
-    const target = await this.resolveBackgroundWorkAgent(agentId);
-    if ("error" in target) return;
-    const { agent, record } = target;
-    // The inventory may have changed while resolving a dormant agent.
-    const items = this.agentManager.getAgentBackgroundWorkSummary(agentId)
-      ? this.agentManager.listAgentBackgroundWork(agentId)
-      : [];
-    this.emit({
-      type: "agent.background_work.update",
-      payload: { agentId, items: this.projectBackgroundWorkItems(items) },
-    });
+    const update = await readBackgroundWorkUpdate(
+      {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        authorization: this.authorization,
+      },
+      agentId,
+    );
+    if (!update) return;
+    const { agent, record, message } = update;
+    this.emit(message);
     if (agent) await this.agentUpdates.forwardLiveAgent(agent);
     else if (record) await this.agentUpdates.forwardStoredAgent(record);
-  }
-
-  private projectBackgroundWorkItems(items: AgentBackgroundWorkItem[]): AgentBackgroundWorkItem[] {
-    if (
-      this.authorization.allowsPermission("automation.manage") &&
-      this.authorization.allowsInbound({ type: "agent.background_work.stop.request" })
-    ) {
-      return items;
-    }
-    return items.map((item) => {
-      if (!isDaemonBackgroundWorkItem(item)) return item;
-      const { canStop: _canStop, stopToken: _stopToken, ...visible } = item;
-      return visible;
-    });
   }
 
   private emitProviderSubagentWorkspaceUpdate(event: ProviderSubagentManagerEvent): void {
@@ -2406,7 +2320,7 @@ export class Session {
     const parentAgentId =
       event.type === "upsert" ? event.subagent.parentAgentId : event.parentAgentId;
     const parent = this.agentManager.getAgent(parentAgentId);
-    if (!parent?.workspaceId) {
+    if (!parent?.workspaceId || parent.internal) {
       return;
     }
     void this.emitWorkspaceUpdateForWorkspaceId(parent.workspaceId).catch((error) => {
@@ -2586,11 +2500,9 @@ export class Session {
     this.authorization.replacePermissions(permissions);
     this.connectedHostSession?.revoke();
     if (!this.authorization.allowsPermission("workspace.write")) {
-      void this.delivery
-        .releaseFamily("browser-host")
-        .catch((error) =>
-          this.sessionLogger.error({ err: error }, "Failed to release revoked browser hosting"),
-        );
+      void this.browserTools.revoke().catch((error) =>
+        this.sessionLogger.error({ err: error }, "Failed to release revoked browser hosting"),
+      );
     }
     // Binary plugin events skip the outbound permission check, so revocation ends the streams.
     if (!this.authorization.allowsPermission("daemon.manage")) {
@@ -2656,33 +2568,6 @@ export class Session {
 
   public publish(message: SessionOutboundMessage): void {
     this.emit(message);
-  }
-
-  private async registerBrowserHost(
-    request: Extract<SessionInboundMessage, { type: "browser.host.register.request" }>,
-    respond = true,
-  ): Promise<void> {
-    if (!this.browserToolsBroker) throw new Error("Browser hosting is unavailable");
-    let unregister: (() => void) | undefined;
-    const owner = this.delivery.begin("browser-host", undefined, () => unregister?.());
-    try {
-      unregister = this.browserToolsBroker.registerClient({
-        id: owner.id,
-        hostKind: request.hostKind,
-        label: request.label,
-        instanceId: request.instanceId,
-        supportedCommands: request.supportedCommands,
-        sendBrowserAutomationRequest: (message) => owner.emit(message),
-      });
-      if (respond)
-        this.emit({
-          type: "browser.host.register.response",
-          payload: { requestId: request.requestId, subscriptionId: owner.responseId },
-        });
-    } catch (error) {
-      await owner.release();
-      throw error;
-    }
   }
 
   private async subscribeWorkspaceSetup(
@@ -2754,17 +2639,10 @@ export class Session {
     source?: object,
   ): Promise<void> | undefined {
     if (msg.type === "workspace.setup.subscribe.request") return this.subscribeWorkspaceSetup(msg);
-    if (msg.type === "browser.host.register.request") return this.registerBrowserHost(msg);
+    const browsing = this.browserTools.dispatch(source, msg);
+    if (browsing) return browsing;
     if (msg.type === "provider.installation.update.subscribe.request")
       return this.subscribeProviderUpdates(msg);
-    if (msg.type === "browser.automation.execute.response") {
-      if (source)
-        this.browserToolsBroker?.receiveResponse(
-          msg,
-          this.delivery.subscriptionIds(source, "browser-host"),
-        );
-      return Promise.resolve();
-    }
     if (msg.type === "subscription.release.request") {
       return this.delivery.release(msg.subscriptionId).then(() => {
         this.emit({
@@ -2834,7 +2712,7 @@ export class Session {
       case "agent.metadata.update.request":
         return this.handleAgentMetadataUpdateRequest(msg);
       case "workspace.metadata.update.request":
-        return this.handleWorkspaceMetadataUpdateRequest(msg);
+        return this.handleWorkspaceSettingsRequest(msg);
       default:
         return undefined;
     }
@@ -3263,17 +3141,33 @@ export class Session {
       case "agent.timeline.append.request":
         return this.handleAgentTimelineAppendRequest(msg);
       case "agent.timeline.search.request":
-        return this.handleAgentTimelineSearchRequest(msg, source);
       case "agent.timeline.list_prompts.request":
-        return this.handleAgentTimelineListPromptsRequest(msg, source);
+        return queryAgentTimeline({
+          agentManager: this.agentManager,
+          agentStorage: this.agentStorage,
+          logger: this.sessionLogger,
+        }, msg).then((response) => this.emitForSource(response, source));
       case "agent.provider_subagents.list.request":
-        return this.handleProviderSubagentListRequest(msg);
       case "agent.background_work.list.request":
-        return this.handleAgentBackgroundWorkListRequest(msg);
       case "agent.background_work.stop.request":
-        return this.handleAgentBackgroundWorkStopRequest(msg);
       case "agent.provider_subagents.timeline.get.request":
-        return this.handleProviderSubagentTimelineRequest(msg, source);
+        return handleAgentOrchestrationRequest(
+          {
+            agentManager: this.agentManager,
+            agentStorage: this.agentStorage,
+            logger: this.sessionLogger,
+            authorization: this.authorization,
+            supports: (capability) =>
+              source ? this.supportsForSource(capability, source) : this.supports(capability),
+          },
+          msg,
+        ).then((response) => {
+          if (response.type === "agent.provider_subagents.timeline.get.response") {
+            this.emitForSource(response, source);
+          } else {
+            this.emit(response);
+          }
+        });
       case "session.events.set_subscription.request": {
         const owner = this.delivery.begin("events", undefined, async (id) => {
           this.eventSubscriptions.delete(id);
@@ -3461,27 +3355,15 @@ export class Session {
 
   // eslint-disable-next-line complexity
   private dispatchCheckoutMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    const query = this.checkoutSession.queries.dispatch(msg, this.delivery.requestSignal);
+    if (query) return query;
     switch (msg.type) {
       case "diff.subscribe.request":
         return this.diffSession.subscribe(msg, this.delivery, (reply) => this.emit(reply));
       case "diff.unsubscribe.request":
         return this.delivery.release(msg.subscriptionId);
-      case "checkout_status_request":
-        return this.checkoutSession.handleStatusRequest(msg);
-      case "checkout.commits.list.request":
-        return this.checkoutSession.handleCommitsListRequest(msg);
-      case "checkout.worktrees.list.request":
-        return this.checkoutSession.handleWorktreesListRequest(msg);
-      case "checkout.commits.file_diff.request":
-        return this.checkoutSession.handleCommitFileDiffRequest(msg, this.delivery.requestSignal);
-      case "validate_branch_request":
-        return this.checkoutSession.handleValidateBranchRequest(msg);
-      case "branch_suggestions_request":
-        return this.checkoutSession.handleBranchSuggestionsRequest(msg);
       case "directory_suggestions_request":
         return this.handleDirectorySuggestionsRequest(msg);
-      case "checkout.diff.get.request":
-        return this.checkoutSession.handleReadDiffRequest(msg);
       case "subscribe_checkout_diff_request":
         return this.checkoutSession.handleSubscribeDiffRequest(msg, this.delivery);
       case "unsubscribe_checkout_diff_request":
@@ -3568,9 +3450,9 @@ export class Session {
       case "project.remove.request":
         return this.handleProjectRemoveRequest(msg);
       case "workspace.title.set.request":
-        return this.handleWorkspaceTitleSetRequest(msg.workspaceId, msg.title, msg.requestId);
+        return this.handleWorkspaceSettingsRequest(msg);
       case "workspace.pin.set.request":
-        return this.handleWorkspacePinSetRequest(msg.workspaceId, msg.pinned, msg.requestId);
+        return this.handleWorkspaceSettingsRequest(msg);
       case "workspace.base_branch.set.request":
         return this.handleWorkspaceBaseBranchSetRequest(msg);
       default:
@@ -3589,19 +3471,13 @@ export class Session {
   }
 
   private dispatchWorkspaceLabelMessage(msg: SessionInboundMessage): Promise<void> | undefined {
-    switch (msg.type) {
-      case "workspace.label.list.request":
-        return this.handleWorkspaceLabelList(msg);
-      case "workspace.label.assignment.set.request":
-        return this.handleWorkspaceLabelAssignment(msg);
-      case "workspace.label.update.request":
-        return this.handleWorkspaceLabelUpdate(msg);
-      case "workspace.label.delete.request":
-        return this.handleWorkspaceLabelDelete(msg);
-      case "workspace.label.delete.inspect.request":
-        return this.handleWorkspaceLabelDeleteInspection(msg);
-      default:
-        return undefined;
+    if (isWorkspaceLabelRequest(msg)) {
+      return handleWorkspaceLabelRequest(
+        this.workspaceLabelService ?? undefined,
+        this.delivery,
+        (message) => this.emit(message),
+        msg,
+      );
     }
   }
 
@@ -3613,19 +3489,15 @@ export class Session {
       case "file_explorer_request":
         return this.workspaceFilesSession.handleFileExplorerRequest(msg, source);
       case "fs.file.subscribe.request":
-        return this.workspaceFilesSession.handleFileSubscribeRequest(msg, this.delivery);
+        return this.workspaceFilesSession.observation.handleFileSubscribeRequest(msg, this.delivery);
       case "fs.file.unsubscribe.request":
-        return this.workspaceFilesSession.handleFileUnsubscribeRequest(msg, this.delivery);
+        return this.workspaceFilesSession.observation.handleFileUnsubscribeRequest(msg, this.delivery);
       case "fs.file.write.request":
-        return this.workspaceFilesSession.handleFileWriteRequest(msg);
       case "fs.entry.create.request":
-        return this.workspaceFilesSession.handleFileEntryCreateRequest(msg);
       case "fs.entry.rename.request":
-        return this.workspaceFilesSession.handleFileEntryRenameRequest(msg);
       case "fs.entry.duplicate.request":
-        return this.workspaceFilesSession.handleFileEntryDuplicateRequest(msg);
       case "fs.entry.delete.request":
-        return this.workspaceFilesSession.handleFileEntryDeleteRequest(msg);
+        return this.workspaceFilesSession.handleFileMutation(msg);
       case "project_icon_request":
         return this.workspaceFilesSession.handleProjectIconRequest(msg);
       case "project.icon.get.request":
@@ -4379,75 +4251,13 @@ export class Session {
     }
   }
 
-  private async handleWorkspaceTitleSetRequest(
-    workspaceId: string,
-    title: string | null,
-    requestId: string,
+  private async handleWorkspaceSettingsRequest(
+    request: Parameters<typeof changeWorkspaceSettings>[1],
   ): Promise<void> {
-    this.sessionLogger.info(
-      { workspaceId, requestId, hasTitle: typeof title === "string" },
-      "session: workspace.title.set.request",
-    );
-
-    try {
-      const trimmed = title?.trim() ?? "";
-      const nextTitle = trimmed.length === 0 ? null : trimmed;
-      const updatedAt = new Date().toISOString();
-      const updated = await this.workspaceRegistry.update(workspaceId, (existing) => ({
-        ...existing,
-        title: nextTitle,
-        updatedAt,
-      }));
-      if (!updated) {
-        this.emit({
-          type: "workspace.title.set.response",
-          payload: {
-            requestId,
-            workspaceId,
-            accepted: false,
-            title: null,
-            error: "Workspace not found",
-          },
-        });
-        return;
-      }
-
-      this.emit({
-        type: "workspace.title.set.response",
-        payload: {
-          requestId,
-          workspaceId,
-          accepted: true,
-          title: nextTitle,
-          error: null,
-        },
-      });
-
-      await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
-    } catch (error) {
-      this.sessionLogger.error(
-        { err: error, workspaceId, requestId },
-        "session: workspace.title.set.request error",
-      );
-      this.emit({
-        type: "activity_log",
-        payload: {
-          id: uuidv4(),
-          timestamp: new Date(),
-          type: "error",
-          content: `Failed to set workspace title: ${getErrorMessage(error)}`,
-        },
-      });
-      this.emit({
-        type: "workspace.title.set.response",
-        payload: {
-          requestId,
-          workspaceId,
-          accepted: false,
-          title: null,
-          error: getErrorMessageOr(error, "Failed to set workspace title"),
-        },
-      });
+    const response = await changeWorkspaceSettings(this.workspaceRegistry, request);
+    this.emit(response);
+    if (response.payload.accepted) {
+      await this.emitWorkspaceUpdatesForWorkspaceIds([request.workspaceId]);
     }
   }
 
@@ -4477,50 +4287,6 @@ export class Session {
           error: getErrorMessageOr(error, "Failed to update agent metadata"),
         },
       });
-    }
-  }
-
-  private async handleWorkspaceMetadataUpdateRequest(
-    request: Extract<SessionInboundMessage, { type: "workspace.metadata.update.request" }>,
-  ): Promise<void> {
-    const { workspaceId, patch, requestId } = request;
-    this.sessionLogger.info(
-      { workspaceId, requestId },
-      "session: workspace.metadata.update.request",
-    );
-    const reject = (error: string) =>
-      this.emit({
-        type: "workspace.metadata.update.response",
-        payload: { requestId, workspaceId, accepted: false, metadata: null, error },
-      });
-    try {
-      const updatedAt = new Date().toISOString();
-      const updated = await this.workspaceRegistry.update(workspaceId, (existing) => ({
-        ...existing,
-        metadata: applyRecordPatch(existing.metadata, patch),
-        updatedAt,
-      }));
-      if (!updated) {
-        reject("Workspace not found");
-        return;
-      }
-      this.emit({
-        type: "workspace.metadata.update.response",
-        payload: {
-          requestId,
-          workspaceId,
-          accepted: true,
-          metadata: updated.metadata,
-          error: null,
-        },
-      });
-      await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
-    } catch (error) {
-      this.sessionLogger.error(
-        { err: error, workspaceId, requestId },
-        "session: workspace.metadata.update.request error",
-      );
-      reject(getErrorMessageOr(error, "Failed to update workspace metadata"));
     }
   }
 
@@ -4556,52 +4322,6 @@ export class Session {
           error: getErrorMessage(error),
         },
       });
-    }
-  }
-
-  private async handleWorkspacePinSetRequest(
-    workspaceId: string,
-    pinned: boolean,
-    requestId: string,
-  ): Promise<void> {
-    const logContext = { workspaceId, pinned, requestId };
-    this.sessionLogger.info(logContext, "session: workspace.pin.set.request");
-    const emitResponse = (accepted: boolean, pinnedAt: string | null, error: string | null) => {
-      this.emit({
-        type: "workspace.pin.set.response",
-        payload: { requestId, workspaceId, accepted, pinnedAt, error },
-      });
-    };
-
-    try {
-      const nextPinnedAt = pinned ? new Date().toISOString() : null;
-      const updatedAt = new Date().toISOString();
-      const updated = await this.workspaceRegistry.update(workspaceId, (existing) => ({
-        ...existing,
-        pinnedAt: nextPinnedAt,
-        updatedAt,
-      }));
-      if (!updated) {
-        emitResponse(false, null, "Workspace not found");
-        return;
-      }
-      emitResponse(true, nextPinnedAt, null);
-      await this.emitWorkspaceUpdatesForWorkspaceIds([workspaceId]);
-    } catch (error) {
-      this.sessionLogger.error(
-        { ...logContext, err: error },
-        "session: workspace.pin.set.request error",
-      );
-      this.emit({
-        type: "activity_log",
-        payload: {
-          id: uuidv4(),
-          timestamp: new Date(),
-          type: "error",
-          content: `Failed to pin workspace: ${getErrorMessage(error)}`,
-        },
-      });
-      emitResponse(false, null, getErrorMessageOr(error, "Failed to pin workspace"));
     }
   }
 
@@ -5706,85 +5426,14 @@ export class Session {
   private async handleListCommandsRequest(
     msg: Extract<SessionInboundMessage, { type: "list_commands_request" }>,
   ): Promise<void> {
-    const { agentId, requestId, draftConfig } = msg;
-    this.sessionLogger.debug(
-      { agentId, draftConfig },
-      `Handling list commands request for agent ${agentId}`,
+    this.emit(
+      await listAgentCommands(msg, {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.sessionLogger,
+        resolveCwd: expandTilde,
+      }),
     );
-
-    try {
-      const existing = this.agentManager.getAgent(agentId);
-      const stored = existing ? null : await this.agentStorage.get(agentId);
-      const agent =
-        existing || (stored && !stored.archivedAt)
-          ? await ensureAgentLoaded(agentId, {
-              agentManager: this.agentManager,
-              agentStorage: this.agentStorage,
-              logger: this.sessionLogger,
-            })
-          : null;
-
-      if (agent?.session?.listCommands) {
-        const commands = dedupeSlashCommands(await agent.session.listCommands());
-        this.emit({
-          type: "list_commands_response",
-          payload: {
-            agentId,
-            commands,
-            error: null,
-            requestId,
-          },
-        });
-        return;
-      }
-
-      if (!agent && draftConfig) {
-        const sessionConfig: AgentSessionConfig = {
-          provider: draftConfig.provider,
-          cwd: expandTilde(draftConfig.cwd),
-          ...(draftConfig.modeId ? { modeId: draftConfig.modeId } : {}),
-          ...(draftConfig.model ? { model: draftConfig.model } : {}),
-          ...(draftConfig.thinkingOptionId
-            ? { thinkingOptionId: draftConfig.thinkingOptionId }
-            : {}),
-        };
-
-        const commands = dedupeSlashCommands(
-          await this.agentManager.listDraftCommands(sessionConfig),
-        );
-        this.emit({
-          type: "list_commands_response",
-          payload: {
-            agentId,
-            commands,
-            error: null,
-            requestId,
-          },
-        });
-        return;
-      }
-
-      this.emit({
-        type: "list_commands_response",
-        payload: {
-          agentId,
-          commands: [],
-          error: agent ? `Agent does not support listing commands` : `Agent not found: ${agentId}`,
-          requestId,
-        },
-      });
-    } catch (error) {
-      this.sessionLogger.error({ err: error, agentId, draftConfig }, "Failed to list commands");
-      this.emit({
-        type: "list_commands_response",
-        payload: {
-          agentId,
-          commands: [],
-          error: getErrorMessage(error),
-          requestId,
-        },
-      });
-    }
   }
 
   /**
@@ -7296,144 +6945,6 @@ export class Session {
     }
   }
 
-  private requireWorkspaceLabels(): WorkspaceLabelService {
-    if (!this.workspaceLabelService) {
-      throw new SessionRequestError("workspace_labels_unavailable", "Workspace labels unavailable");
-    }
-    return this.workspaceLabelService;
-  }
-
-  private emitWorkspaceLabelError(
-    request: { requestId: string; type: string },
-    error: unknown,
-  ): void {
-    this.emit({
-      type: "rpc_error",
-      payload: {
-        requestId: request.requestId,
-        requestType: request.type,
-        code: workspaceLabelErrorCode(error),
-        error: error instanceof Error ? error.message : "Workspace label operation failed",
-      },
-    });
-  }
-
-  private async handleWorkspaceLabelList(
-    request: Extract<SessionInboundMessage, { type: "workspace.label.list.request" }>,
-  ): Promise<void> {
-    const service = this.requireWorkspaceLabels();
-    if (!request.subscribe) {
-      this.emit({
-        type: "workspace.label.list.response",
-        payload: { requestId: request.requestId, ...(await service.list(request.sync)) },
-      });
-      return;
-    }
-    let bootstrap: ReturnType<typeof service.subscribe> | undefined;
-    const owner = this.delivery.begin("labels", request.subscribe.subscriptionId, async () => {
-      await bootstrap?.then(
-        (subscription) => subscription.unsubscribe(),
-        () => undefined,
-      );
-    });
-    try {
-      type LiveChange = Parameters<Parameters<typeof service.subscribe>[0]["onChange"]>[0];
-      const pending = new Map<string, LiveChange>();
-      let ready = false;
-      const emitChange = (change: LiveChange): void => {
-        owner.emit({
-          type: "workspace.label.update",
-          payload: change,
-        });
-      };
-      bootstrap = service.subscribe({
-        cursor: request.sync,
-        onChange: (change) => {
-          if (owner.signal.aborted) return;
-          if (!ready)
-            pending.set(change.kind === "upsert" ? change.label.name : change.name, change);
-          else emitChange(change);
-        },
-      });
-      const subscription = await bootstrap;
-      if (owner.signal.aborted) return;
-      this.emit({
-        type: "workspace.label.list.response",
-        payload: {
-          requestId: request.requestId,
-          subscriptionId: owner.responseId,
-          ...subscription.snapshot,
-        },
-      });
-      ready = true;
-      for (const change of pending.values()) {
-        if (change.seq > subscription.snapshot.sync.headSeq) emitChange(change);
-      }
-      pending.clear();
-    } catch (error) {
-      await owner.release();
-      this.emitWorkspaceLabelError(request, error);
-    }
-  }
-
-  private async handleWorkspaceLabelAssignment(
-    request: Extract<SessionInboundMessage, { type: "workspace.label.assignment.set.request" }>,
-  ): Promise<void> {
-    try {
-      const result = await this.requireWorkspaceLabels().setAssignment(request);
-      this.emit({
-        type: "workspace.label.assignment.set.response",
-        payload: { requestId: request.requestId, ...result },
-      });
-    } catch (error) {
-      this.emitWorkspaceLabelError(request, error);
-    }
-  }
-
-  private async handleWorkspaceLabelUpdate(
-    request: Extract<SessionInboundMessage, { type: "workspace.label.update.request" }>,
-  ): Promise<void> {
-    try {
-      const result = await this.requireWorkspaceLabels().update(request);
-      this.emit({
-        type: "workspace.label.update.response",
-        payload: { requestId: request.requestId, ...result },
-      });
-    } catch (error) {
-      this.emitWorkspaceLabelError(request, error);
-    }
-  }
-
-  private async handleWorkspaceLabelDelete(
-    request: Extract<SessionInboundMessage, { type: "workspace.label.delete.request" }>,
-  ): Promise<void> {
-    try {
-      const result = await this.requireWorkspaceLabels().delete(request.name);
-      this.emit({
-        type: "workspace.label.delete.response",
-        payload: { requestId: request.requestId, ...result },
-      });
-    } catch (error) {
-      this.emitWorkspaceLabelError(request, error);
-    }
-  }
-
-  private async handleWorkspaceLabelDeleteInspection(
-    request: Extract<SessionInboundMessage, { type: "workspace.label.delete.inspect.request" }>,
-  ): Promise<void> {
-    try {
-      const affectedWorkspaceCount = await this.requireWorkspaceLabels().countAffectedWorkspaces(
-        request.name,
-      );
-      this.emit({
-        type: "workspace.label.delete.inspect.response",
-        payload: { requestId: request.requestId, affectedWorkspaceCount },
-      });
-    } catch (error) {
-      this.emitWorkspaceLabelError(request, error);
-    }
-  }
-
   private async readAgentDirectorySync(
     request: Extract<SessionInboundMessage, { type: "fetch_agents_request" }>,
     backgroundVisibility: BackgroundVisibility,
@@ -8844,315 +8355,6 @@ export class Session {
     });
   }
 
-  private async handleAgentTimelineSearchRequest(
-    msg: Extract<SessionInboundMessage, { type: "agent.timeline.search.request" }>,
-    source?: object,
-  ): Promise<void> {
-    try {
-      await ensureAgentLoaded(msg.agentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
-      const rows = await this.agentManager.getTimelineRows(msg.agentId);
-      const { epoch } = this.agentManager.fetchTimeline(msg.agentId, {
-        direction: "tail",
-        limit: 1,
-      });
-      const result = await searchTimeline({ rows, query: msg.query, cursor: msg.cursor });
-      if (
-        this.agentManager.fetchTimeline(msg.agentId, { direction: "tail", limit: 1 }).epoch !==
-        epoch
-      ) {
-        throw new Error("History changed; search again");
-      }
-      this.emitForSource(
-        {
-          type: "agent.timeline.search.response",
-          payload: {
-            requestId: msg.requestId,
-            agentId: msg.agentId,
-            epoch,
-            ...result,
-            error: null,
-          },
-        },
-        source,
-      );
-    } catch (error) {
-      this.emitForSource(
-        {
-          type: "agent.timeline.search.response",
-          payload: {
-            requestId: msg.requestId,
-            agentId: msg.agentId,
-            epoch: "",
-            locations: [],
-            nextCursor: null,
-            error: error instanceof Error ? error.message : String(error),
-          },
-        },
-        source,
-      );
-    }
-  }
-
-  private async handleAgentTimelineListPromptsRequest(
-    msg: Extract<SessionInboundMessage, { type: "agent.timeline.list_prompts.request" }>,
-    source?: object,
-  ): Promise<void> {
-    try {
-      await ensureAgentLoaded(msg.agentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
-      const rows = await this.agentManager.getTimelineRows(msg.agentId);
-      const timeline = this.agentManager.fetchTimeline(msg.agentId, {
-        direction: "tail",
-        limit: 1,
-      });
-      const index = buildTimelinePromptIndex(timeline.epoch, rows);
-      this.emitForSource(
-        {
-          type: "agent.timeline.list_prompts.response",
-          payload: {
-            requestId: msg.requestId,
-            agentId: msg.agentId,
-            ...index,
-            error: null,
-          },
-        },
-        source,
-      );
-    } catch (error) {
-      this.sessionLogger.error(
-        { err: error, agentId: msg.agentId },
-        "Failed to handle agent.timeline.list_prompts.request",
-      );
-      this.emitForSource(
-        {
-          type: "agent.timeline.list_prompts.response",
-          payload: {
-            requestId: msg.requestId,
-            agentId: msg.agentId,
-            epoch: "",
-            prompts: [],
-            error: error instanceof Error ? error.message : String(error),
-          },
-        },
-        source,
-      );
-    }
-  }
-
-  private async handleProviderSubagentListRequest(
-    msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.list.request" }>,
-  ): Promise<void> {
-    try {
-      await ensureUnarchivedAgentLoaded(msg.parentAgentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
-      this.emit({
-        type: "agent.provider_subagents.list.response",
-        payload: {
-          requestId: msg.requestId,
-          parentAgentId: msg.parentAgentId,
-          subagents: this.agentManager.listProviderSubagents(msg.parentAgentId),
-          error: null,
-        },
-      });
-    } catch (error) {
-      this.emit({
-        type: "agent.provider_subagents.list.response",
-        payload: {
-          requestId: msg.requestId,
-          parentAgentId: msg.parentAgentId,
-          subagents: [],
-          error: error instanceof Error ? error.message : String(error),
-        },
-      });
-    }
-  }
-
-  private async handleAgentBackgroundWorkStopRequest(
-    msg: Extract<SessionInboundMessage, { type: "agent.background_work.stop.request" }>,
-  ): Promise<void> {
-    let error: string | null = null;
-    try {
-      const target = await this.resolveBackgroundWorkAgent(msg.agentId);
-      if ("error" in target) throw new Error(target.error);
-      await this.agentManager.stopAgentBackgroundWork({
-        agentId: msg.agentId,
-        itemId: msg.itemId,
-        stopToken: msg.stopToken,
-        canManageAutomation: this.authorization.allowsPermission("automation.manage"),
-      });
-    } catch (cause) {
-      error = cause instanceof Error ? cause.message : String(cause);
-    }
-    this.emit({
-      type: "agent.background_work.stop.response",
-      payload: {
-        requestId: msg.requestId,
-        agentId: msg.agentId,
-        itemId: msg.itemId,
-        error,
-      },
-    });
-  }
-
-  private async handleAgentBackgroundWorkListRequest(
-    msg: Extract<SessionInboundMessage, { type: "agent.background_work.list.request" }>,
-  ): Promise<void> {
-    try {
-      this.emit({
-        type: "agent.background_work.list.response",
-        payload: {
-          requestId: msg.requestId,
-          agentId: msg.agentId,
-          items: await this.readAgentBackgroundWork(msg.agentId),
-          error: null,
-        },
-      });
-    } catch (error) {
-      this.emit({
-        type: "agent.background_work.list.response",
-        payload: {
-          requestId: msg.requestId,
-          agentId: msg.agentId,
-          items: [],
-          error: error instanceof Error ? error.message : String(error),
-        },
-      });
-    }
-  }
-
-  private async readAgentBackgroundWork(agentId: string): Promise<AgentBackgroundWorkItem[]> {
-    const target = await this.resolveBackgroundWorkAgent(agentId);
-    if ("error" in target) throw new Error(target.error);
-    if (!this.agentManager.getAgentBackgroundWorkSummary(agentId)) {
-      throw new Error("Background work inventory is unavailable");
-    }
-    return this.projectBackgroundWorkItems(this.agentManager.listAgentBackgroundWork(agentId));
-  }
-
-  private async resolveBackgroundWorkAgent(
-    agentId: string,
-  ): Promise<{ agent: ManagedAgent | null; record: StoredAgentRecord | null } | { error: string }> {
-    const record = await this.agentStorage.get(agentId);
-    const agent = this.agentManager.getAgent(agentId);
-    if ((!agent && !record) || agent?.internal || record?.internal) {
-      return { error: `Unknown agent '${agentId}'` };
-    }
-    if (record?.archivedAt) {
-      return { error: `Agent is archived: ${agentId}` };
-    }
-    return { agent, record };
-  }
-
-  private async handleProviderSubagentTimelineRequest(
-    msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.timeline.get.request" }>,
-    source?: object,
-  ): Promise<void> {
-    const direction: AgentTimelineFetchDirection = msg.direction ?? (msg.cursor ? "after" : "tail");
-    try {
-      await ensureUnarchivedAgentLoaded(msg.parentAgentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
-      const descriptor = this.agentManager.getProviderSubagent(msg.parentAgentId, msg.subagentId);
-      if (!descriptor) {
-        throw new Error("Provider subagent not found");
-      }
-      // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove after 2027-03-14.
-      const supportsProjection = source
-        ? this.supportsForSource(CLIENT_CAPS.projectedSubagentTimeline, source)
-        : this.supports(CLIENT_CAPS.projectedSubagentTimeline);
-      const timeline = this.agentManager.fetchProviderSubagentTimeline(
-        msg.parentAgentId,
-        msg.subagentId,
-        {
-          direction,
-          cursor: msg.cursor,
-          limit: msg.limit ?? (direction === "after" ? 0 : 200),
-        },
-      );
-      const rows = timeline.rows.filter((row) => this.supportsTimelineItem(row.item, source));
-      this.emitForSource(
-        {
-          type: "agent.provider_subagents.timeline.get.response",
-          payload: {
-            requestId: msg.requestId,
-            parentAgentId: msg.parentAgentId,
-            subagentId: msg.subagentId,
-            provider: descriptor.provider,
-            direction,
-            epoch: timeline.epoch,
-            projection: "projected",
-            startCursor:
-              timeline.startSeq === null ? null : { epoch: timeline.epoch, seq: timeline.startSeq },
-            endCursor:
-              timeline.endSeq === null ? null : { epoch: timeline.epoch, seq: timeline.endSeq },
-            reset: timeline.reset,
-            staleCursor: timeline.staleCursor,
-            gap: timeline.gap,
-            window: timeline.window,
-            hasOlder: supportsProjection && timeline.hasOlder,
-            hasNewer: supportsProjection && timeline.hasNewer,
-            rows: supportsProjection
-              ? rows.map((row) => ({
-                  item: row.item,
-                  timestamp: row.timestamp,
-                  seq: row.seqEnd,
-                  seqStart: row.seqStart,
-                  seqEnd: row.seqEnd,
-                  sourceSeqRanges: row.sourceSeqRanges,
-                }))
-              : [
-                  {
-                    seq: timeline.window.maxSeq,
-                    timestamp: new Date().toISOString(),
-                    item: {
-                      type: "assistant_message",
-                      text: "Please upgrade the Paseo app to view this subagent conversation.",
-                    },
-                  },
-                ],
-            error: null,
-          },
-        },
-        source,
-      );
-    } catch (error) {
-      this.emitForSource(
-        {
-          type: "agent.provider_subagents.timeline.get.response",
-          payload: {
-            requestId: msg.requestId,
-            parentAgentId: msg.parentAgentId,
-            subagentId: msg.subagentId,
-            provider: null,
-            direction,
-            epoch: "",
-            reset: false,
-            staleCursor: false,
-            gap: false,
-            window: { minSeq: 0, maxSeq: 0, nextSeq: 0 },
-            hasOlder: false,
-            hasNewer: false,
-            rows: [],
-            error: error instanceof Error ? error.message : String(error),
-          },
-        },
-        source,
-      );
-    }
-  }
-
   private async handleAgentForkContextRequest(
     msg: Extract<SessionInboundMessage, { type: "agent.fork_context.request" }>,
   ): Promise<void> {
@@ -9744,57 +8946,6 @@ export class Session {
   }
 }
 
-interface CloneRepositoryInput {
-  name: string;
-  displayName: string;
-  cloneUrl: string;
-}
-
-function normalizeCloneRepository(input: {
-  repo: string;
-  cloneProtocol?: "https" | "ssh";
-}): CloneRepositoryInput {
-  const trimmed = input.repo.trim();
-  if (!trimmed) {
-    throw new Error("Repository is required");
-  }
-
-  const remote = parseGitRemoteLocation(trimmed);
-  if (remote) {
-    const segments = remote.path.split("/").filter(Boolean);
-    const name = segments.at(-1);
-    if (!name || !isValidGitHubRepoSegment(name)) {
-      throw new Error("Repository name contains invalid characters");
-    }
-    return { name, displayName: remote.path, cloneUrl: trimmed };
-  }
-
-  const [owner, rawName, ...extra] = trimmed.split("/");
-  if (!owner || !rawName || extra.length > 0) {
-    throw new Error("Repository must use owner/repo format or a git remote URL");
-  }
-  const name = rawName.endsWith(".git") ? rawName.slice(0, -4) : rawName;
-  if (!isValidGitHubRepoSegment(owner) || !isValidGitHubRepoSegment(name)) {
-    throw new Error("Repository contains invalid characters");
-  }
-  if (!input.cloneProtocol) {
-    throw new Error("Clone protocol is required for owner/repo repository names");
-  }
-  const cloneUrl =
-    input.cloneProtocol === "ssh"
-      ? `git@github.com:${owner}/${name}.git`
-      : `https://github.com/${owner}/${name}.git`;
-  return {
-    name,
-    displayName: `${owner}/${name}`,
-    cloneUrl,
-  };
-}
-
-function isValidGitHubRepoSegment(value: string): boolean {
-  return /^[A-Za-z0-9._-]+$/u.test(value);
-}
-
 function statusEventCategory(
   status: Extract<SessionOutboundMessage, { type: "status" }>["payload"]["status"],
 ): SessionEventSubscription | null {
@@ -9877,15 +9028,4 @@ function createHostSession(options: SessionOptions, session: Session): Connected
 
 function hostSource(options: SessionOptions): string {
   return options.sourceId ?? "owner";
-}
-
-function dedupeSlashCommands<T extends { name: string }>(commands: readonly T[]): T[] {
-  const seen = new Set<string>();
-  const unique: T[] = [];
-  for (const command of commands) {
-    if (seen.has(command.name)) continue;
-    seen.add(command.name);
-    unique.push(command);
-  }
-  return unique;
 }

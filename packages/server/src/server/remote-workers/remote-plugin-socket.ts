@@ -2,6 +2,7 @@
 import type { PluginSessionSocket } from "../plugins/session-socket.js";
 import type { WorkerBinding } from "./leases.js";
 import type { openCentralAgents } from "./central-agents.js";
+import type { createCentralDirectory } from "./central-directory.js";
 import { decodeJson } from "./execution-protocol.js";
 
 /** An internal plugin socket is admitted by the worker channel, with a scoped read/control surface. */
@@ -11,6 +12,7 @@ export function attachWorkerPluginSocket(options: {
   target: WorkerBinding;
   version: string;
   scope(): Promise<Awaited<ReturnType<typeof openCentralAgents>>>;
+  directory(): Promise<ReturnType<typeof createCentralDirectory>>;
 }) {
   const { socket, target, signal } = options;
   let hello = false;
@@ -50,6 +52,7 @@ export function attachWorkerPluginSocket(options: {
             protocolVersion: 1,
             version: options.version,
             permissions: ["daemon.read", "workspace.read"],
+            features: { workspaceMultiplicity: true },
           },
         },
       });
@@ -72,11 +75,25 @@ export function attachWorkerPluginSocket(options: {
         );
       return;
     }
+    if (request.type === "fetch_workspaces_request" && !request.subscribe && !request.sync) {
+      void options
+        .directory()
+        .then((directory) => directory.read(request))
+        .then(
+          (message) => send({ type: "session", message }),
+          () => socket.close(),
+        );
+      return;
+    }
     send({
       type: "session",
       message: {
         type: "rpc_error",
-        payload: { requestId, error: "worker_plugin_session_operation_unavailable" },
+        payload: {
+          requestId,
+          requestType: request.type,
+          error: "worker_plugin_session_operation_unavailable",
+        },
       },
     });
   });

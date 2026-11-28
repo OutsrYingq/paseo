@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -9,6 +9,7 @@ import {
   type PersistedProjectRecord,
   type ProjectRegistry,
 } from "../server/workspace-registry.js";
+import { executeResidentProjectIcon } from "../server/remote-workers/resident-project-icons.js";
 import {
   ProjectIconReader,
   readProjectIcon,
@@ -147,6 +148,42 @@ describe("project custom icon", () => {
     await expect(
       readProjectIcon({ paseoHome: target.paseoHome, project: stored }),
     ).resolves.toBeNull();
+  });
+
+  it("uses the resident's registered project to scope icon discovery and uploaded bytes", async () => {
+    const target = await project();
+    const outside = await tempDir("paseo-icon-outside-");
+    await writeFile(join(outside, "favicon.png"), PNG_1X1);
+    await symlink(outside, join(target.rootPath, "public"), process.platform === "win32" ? "junction" : "dir");
+    const projectId = "project-a";
+    let record = createPersistedProjectRecord({
+      projectId,
+      rootPath: target.rootPath,
+      kind: "non_git",
+      displayName: "repo",
+      createdAt: "2026-07-22T12:00:00.000Z",
+      updatedAt: "2026-07-22T12:00:00.000Z",
+    });
+    const options = {
+      roots: [target.rootPath],
+      paseoHome: target.paseoHome,
+      listProjects: async () => [record],
+      signal: new AbortController().signal,
+    };
+    const get = { kind: "projectIconGet", projectId } as const;
+    await expect(executeResidentProjectIcon(options, get)).resolves.toBeNull();
+    await expect(executeResidentProjectIcon(options, { ...get, projectId: "foreign" }))
+      .rejects.toThrow("worker_project_not_found");
+    const revision = await executeResidentProjectIcon(options, {
+      kind: "projectIconSet",
+      projectId,
+      source: { type: "upload", data: PNG_1X1_ICON.data },
+    });
+    if (typeof revision !== "string") throw new Error("Custom icon revision was not returned");
+    record = { ...record, customIconRevision: revision };
+    await expect(executeResidentProjectIcon(options, get)).resolves.toEqual(PNG_1X1_ICON);
+    await executeResidentProjectIcon(options, { kind: "projectIconRemove", projectId });
+    await expect(executeResidentProjectIcon(options, get)).resolves.toBeNull();
   });
 
   it.each([

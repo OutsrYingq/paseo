@@ -86,7 +86,7 @@ describe("WorkspaceFilesSession", () => {
     const cwd = makeDir("workspace-files-create-");
     const { subsystem, emitted } = makeSubsystem();
 
-    await subsystem.handleFileEntryCreateRequest({
+    await subsystem.handleFileMutation({
       type: "fs.entry.create.request",
       cwd,
       parentPath: ".",
@@ -116,7 +116,7 @@ describe("WorkspaceFilesSession", () => {
     writeFileSync(join(cwd, "notes.txt"), "existing");
     const { subsystem, emitted } = makeSubsystem();
 
-    await subsystem.handleFileEntryCreateRequest({
+    await subsystem.handleFileMutation({
       type: "fs.entry.create.request",
       cwd,
       parentPath: ".",
@@ -145,7 +145,7 @@ describe("WorkspaceFilesSession", () => {
     writeFileSync(join(cwd, "notes.txt"), "rename me");
     const { subsystem, emitted } = makeSubsystem();
 
-    await subsystem.handleFileEntryRenameRequest({
+    await subsystem.handleFileMutation({
       type: "fs.entry.rename.request",
       cwd,
       path: "notes.txt",
@@ -174,7 +174,7 @@ describe("WorkspaceFilesSession", () => {
     const cwd = makeDir("workspace-files-rename-error-");
     const { subsystem, emitted } = makeSubsystem();
 
-    await subsystem.handleFileEntryRenameRequest({
+    await subsystem.handleFileMutation({
       type: "fs.entry.rename.request",
       cwd,
       path: "missing.txt",
@@ -202,7 +202,7 @@ describe("WorkspaceFilesSession", () => {
     writeFileSync(join(cwd, "notes.txt"), "duplicate me");
     const { subsystem, emitted } = makeSubsystem();
 
-    await subsystem.handleFileEntryDuplicateRequest({
+    await subsystem.handleFileMutation({
       type: "fs.entry.duplicate.request",
       cwd,
       path: "notes.txt",
@@ -229,7 +229,7 @@ describe("WorkspaceFilesSession", () => {
     const cwd = makeDir("workspace-files-duplicate-error-");
     const { subsystem, emitted } = makeSubsystem();
 
-    await subsystem.handleFileEntryDuplicateRequest({
+    await subsystem.handleFileMutation({
       type: "fs.entry.duplicate.request",
       cwd,
       path: "missing.txt",
@@ -256,7 +256,7 @@ describe("WorkspaceFilesSession", () => {
     writeFileSync(join(cwd, "notes.txt"), "delete me");
     const { subsystem, emitted } = makeSubsystem();
 
-    await subsystem.handleFileEntryDeleteRequest({
+    await subsystem.handleFileMutation({
       type: "fs.entry.delete.request",
       cwd,
       path: "notes.txt",
@@ -282,7 +282,7 @@ describe("WorkspaceFilesSession", () => {
     const cwd = makeDir("workspace-files-delete-error-");
     const { subsystem, emitted } = makeSubsystem();
 
-    await subsystem.handleFileEntryDeleteRequest({
+    await subsystem.handleFileMutation({
       type: "fs.entry.delete.request",
       cwd,
       path: "missing.txt",

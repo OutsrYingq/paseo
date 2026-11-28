@@ -8,6 +8,7 @@ import {
   BufferedPluginSubscription,
   type PluginRuntimeSubscription,
 } from "../plugins/runtime-subscription.js";
+import type { ListUsageReportsOptions } from "../plugins/usage-sources/index.js";
 import { PluginSessionSocket } from "../plugins/session-socket.js";
 import type { RemotePluginScope } from "./remote-plugins.js";
 import {
@@ -39,8 +40,10 @@ export interface RemotePluginClientOptions {
 
 type Notification = Extract<
   RemotePluginEvent["event"],
-  { type: "catalogChanged" | "settingsChanged" | "providersChanged" }
+  { type: "catalogChanged" | "settingsChanged" | "providersChanged" | "pluginNotification" }
 >;
+
+export class RemotePluginHandlerError extends Error {}
 
 /** One proxy per authorized execution connection. Keep it alongside RemoteProviderProcesses. */
 export class RemotePluginClient {
@@ -52,6 +55,7 @@ export class RemotePluginClient {
   private readonly subscriptions = new Map<string, BufferedPluginSubscription>();
   private readonly providers = new Map<string, ProviderRegistration>();
   private readonly providerListeners = new Map<string, Set<(event: ProviderEvent) => void>>();
+  private readonly usageListeners = new Map<string, NonNullable<ListUsageReportsOptions["onReport"]>>();
   private readonly listeners = new Set<(event: Notification) => void>();
 
   constructor(private readonly options: RemotePluginClientOptions) {
@@ -66,9 +70,25 @@ export class RemotePluginClient {
     this.options.signal.throwIfAborted();
     const result = RemotePluginResultSchema.parse(raw);
     if (result.action !== request.action) throw new Error("worker_plugin_reply_mismatch");
+    if ("error" in result) throw new RemotePluginHandlerError(result.error);
     return RemotePluginValueSchemas[request.action].parse(result.value) as RemotePluginValue<
       A["action"]
     >;
+  }
+
+  async listUsageReports(options: ListUsageReportsOptions, sessionId?: string) {
+    const { forceRefresh, reportIds, onReport } = options;
+    const queryId = randomUUID();
+    if (onReport) this.usageListeners.set(queryId, onReport);
+    try {
+      return await this.request({ action: "usageReports", queryId, forceRefresh, reportIds, sessionId });
+    } finally {
+      this.usageListeners.delete(queryId);
+    }
+  }
+
+  listLegacyUsage() {
+    return this.request({ action: "usageLegacy" });
   }
 
   subscribe(listener: (event: Notification) => void): () => void {
@@ -187,7 +207,11 @@ export class RemotePluginClient {
       case "catalogChanged":
       case "settingsChanged":
       case "providersChanged":
+      case "pluginNotification":
         for (const listener of this.listeners) listener(event);
+        break;
+      case "usageReport":
+        this.usageListeners.get(event.queryId)?.(event.report);
         break;
       case "subscriptionEvent":
         this.subscriptions.get(event.subscriptionId)?.event(decodeRemotePluginPayload(event.value));
@@ -267,6 +291,7 @@ export class RemotePluginClient {
     this.subscriptions.clear();
     for (const listeners of this.providerListeners.values()) listeners.clear();
     this.providerListeners.clear();
+    this.usageListeners.clear();
     this.providers.clear();
     this.listeners.clear();
   }

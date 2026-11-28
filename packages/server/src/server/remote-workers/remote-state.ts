@@ -14,6 +14,9 @@ export function createRemoteState(connection: WorkerConnection) {
       exclusive,
     });
   };
+  async function remove(file: string) {
+    await connection.call({ kind: "deleteState", path: normalize(file) });
+  }
   const agents: AgentStorageFiles = {
     async list(directory) {
       const entries = await connection.call({
@@ -35,9 +38,7 @@ export function createRemoteState(connection: WorkerConnection) {
       return text;
     },
     write: (file, record) => write(file, JSON.stringify(record, null, 2)),
-    async unlink(file) {
-      await connection.call({ kind: "deleteState", path: normalize(file) });
-    },
+    unlink: remove,
     // State uses the worker's POSIX volume in remote mode.
     async isSameFile(left, right) {
       return left === right;
@@ -53,5 +54,5 @@ export function createRemoteState(connection: WorkerConnection) {
     read,
     write: (file, value) => write(file, JSON.stringify(value, null, 2)),
   };
-  return { agents, creation, receipts, read, write };
+  return { agents, creation, receipts, read, write, remove };
 }

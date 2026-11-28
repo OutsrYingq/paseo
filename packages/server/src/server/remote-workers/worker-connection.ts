@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { DICTATION_HEADER, DICTATION_VERSION } from "./remote-dictation-protocol.js";
+import { VOICE_HEADER, VOICE_VERSION, VOICE_OPERATION_KINDS } from "./remote-voice-protocol.js";
+import { BROWSER_HEADER, BROWSER_OPERATION_KINDS, BROWSER_VERSION } from "./remote-browser-protocol.js";
 import { Agent as HttpsAgent } from "node:https";
 import { checkServerIdentity, type ConnectionOptions, type PeerCertificate } from "node:tls";
 import { WebSocket } from "ws";
@@ -9,6 +12,12 @@ import {
   EXECUTION_MAX_FRAME,
   EXECUTION_PROTOCOL,
   RUNTIME_RESTART_FEATURE,
+  WORKSPACE_OPERATIONS_HEADER,
+  PUSH_HEADER,
+  PUSH_VERSION,
+  PUSH_OPERATION_KINDS,
+  WORKSPACE_OPERATIONS_VERSION,
+  WORKSPACE_OPERATION_KINDS,
   ExecutionResponseSchema,
   WorkerOperationError,
   decodeJson,
@@ -17,6 +26,19 @@ import {
   type WorkerOperation,
   type WorkerResult,
 } from "./execution-protocol.js";
+import type { RemotePluginAction } from "./remote-plugins-protocol.js";
+
+const pluginSourceActions: ReadonlySet<RemotePluginAction["action"]> = new Set([
+  "listRegistry",
+  "getRegistryPlugin",
+  "installSource",
+  "statusSources",
+  "updateSources",
+  "previewUpdates",
+  "applyUpdates",
+  "usageReports",
+  "usageLegacy",
+]);
 
 export type WorkerTlsClientOptions = Pick<
   ConnectionOptions,
@@ -33,6 +55,31 @@ export class WorkerConnection {
   private readonly lifetime = new AbortController();
   readonly signal = this.lifetime.signal;
   private runtimeRestart = false;
+  private workspaceOperations = false;
+  private dictation = false;
+  private voice = false;
+  private push = false;
+  private browser = false;
+
+  get supportsBrowser() {
+    return this.browser;
+  }
+
+  get supportsVoice() {
+    return this.voice;
+  }
+
+  get supportsPush() {
+    return this.push;
+  }
+
+  get supportsDictation() {
+    return this.dictation;
+  }
+
+  get supportsWorkspaceOperations() {
+    return this.workspaceOperations;
+  }
 
   get supportsRuntimeRestart() {
     return this.runtimeRestart;
@@ -62,7 +109,14 @@ export class WorkerConnection {
     });
     this.socket = new WebSocket(endpoint, EXECUTION_PROTOCOL, {
       agent,
-      headers: { [EXECUTION_FEATURES_HEADER]: RUNTIME_RESTART_FEATURE },
+      headers: {
+        [EXECUTION_FEATURES_HEADER]: RUNTIME_RESTART_FEATURE,
+        [WORKSPACE_OPERATIONS_HEADER]: WORKSPACE_OPERATIONS_VERSION,
+        [DICTATION_HEADER]: DICTATION_VERSION,
+        [VOICE_HEADER]: VOICE_VERSION,
+        [PUSH_HEADER]: PUSH_VERSION,
+        [BROWSER_HEADER]: BROWSER_VERSION,
+      },
       followRedirects: false,
       handshakeTimeout: 5_000,
       maxPayload: EXECUTION_MAX_FRAME,
@@ -95,6 +149,11 @@ export class WorkerConnection {
           if (message.kind !== "bound" || !sameWorkerBinding(binding, message.binding))
             return this.close();
           this.runtimeRestart = message.restartRuntime === true;
+          this.workspaceOperations = message.workspaceOperations === true;
+          this.dictation = message.dictation === true;
+          this.voice = message.voice === true;
+          this.push = message.push === true;
+          this.browser = message.browser === true;
           bound = true;
           clearTimeout(timer);
           resolve();
@@ -129,6 +188,26 @@ export class WorkerConnection {
     operation: WorkerOperation & { kind: K },
   ): Promise<WorkerResult<K>> {
     await this.ready();
+    const request: WorkerOperation = operation;
+    if (VOICE_OPERATION_KINDS.has(operation.kind) && !this.voice) {
+      throw new WorkerOperationError("worker_voice_unsupported");
+    }
+    if (PUSH_OPERATION_KINDS.has(operation.kind) && !this.push) {
+      throw new WorkerOperationError("worker_push_unsupported");
+    }
+    if (BROWSER_OPERATION_KINDS.has(operation.kind) && !this.browser) {
+      throw new WorkerOperationError("worker_browser_unsupported");
+    }
+    if (WORKSPACE_OPERATION_KINDS.has(operation.kind) && !this.workspaceOperations) {
+      throw new WorkerOperationError("worker_workspace_operations_unsupported");
+    }
+    if (
+      request.kind === "plugin" &&
+      pluginSourceActions.has(request.request.action) &&
+      !this.workspaceOperations
+    ) {
+      throw new WorkerOperationError("worker_plugin_sources_unsupported");
+    }
     if (this.pending.size >= EXECUTION_MAX_CALLS) throw new WorkerOperationError("worker_busy");
     const id = randomUUID();
     const frame = JSON.stringify({ kind: "call", id, operation });

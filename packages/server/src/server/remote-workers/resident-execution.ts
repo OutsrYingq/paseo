@@ -17,6 +17,11 @@ import {
   EXECUTION_PATH,
   EXECUTION_PROTOCOL,
   RUNTIME_RESTART_FEATURE,
+  WORKSPACE_OPERATIONS_HEADER,
+  PUSH_HEADER,
+  PUSH_VERSION,
+  PUSH_OPERATION_KINDS,
+  WORKSPACE_OPERATIONS_VERSION,
   ExecutionRequestSchema,
   WorkerOperationError,
   decodeJson,
@@ -25,10 +30,18 @@ import {
   type WorkerOperation,
 } from "./execution-protocol.js";
 import { WorkerBindingSchema, sameWorkerBinding, type WorkerBinding } from "./leases.js";
+import { DICTATION_HEADER, DICTATION_VERSION } from "./remote-dictation-protocol.js";
+import { VOICE_HEADER, VOICE_VERSION, VOICE_OPERATION_KINDS } from "./remote-voice-protocol.js";
+import { BROWSER_HEADER, BROWSER_OPERATION_KINDS, BROWSER_VERSION } from "./remote-browser-protocol.js";
 
 export interface ResidentRuntime {
   execute(operation: Exclude<WorkerOperation, { kind: "restartRuntime" }>): Promise<unknown>;
   restartRuntime?(keepTerminals: boolean): Promise<void>;
+  workspaceOperations?: true;
+  dictation?: true;
+  voice?: true;
+  push?: true;
+  browser?: true;
   close(): Promise<void>;
 }
 
@@ -100,6 +113,11 @@ export async function startResidentExecution(options: ResidentExecutionOptions) 
         ownBinding,
         options,
         request.headers[EXECUTION_FEATURES_HEADER] === RUNTIME_RESTART_FEATURE,
+        request.headers[WORKSPACE_OPERATIONS_HEADER] === WORKSPACE_OPERATIONS_VERSION,
+        request.headers[DICTATION_HEADER] === DICTATION_VERSION,
+        request.headers[VOICE_HEADER] === VOICE_VERSION,
+        request.headers[PUSH_HEADER] === PUSH_VERSION,
+        request.headers[BROWSER_HEADER] === BROWSER_VERSION,
       )
         .catch((error: unknown) => {
           // Stay fenced until the host stops this resident, even if no client is connected.
@@ -159,6 +177,11 @@ async function handleChannel(
   binding: WorkerBinding,
   options: ResidentExecutionOptions,
   negotiateRestart: boolean,
+  negotiateWorkspaceOperations: boolean,
+  negotiateDictation: boolean,
+  negotiateVoice: boolean,
+  negotiatePush: boolean,
+  negotiateBrowser: boolean,
 ): Promise<void> {
   const lifetime = new AbortController();
   const inflight = new Map<string, Promise<void>>();
@@ -203,7 +226,10 @@ async function handleChannel(
       if (runtime || !sameWorkerBinding(binding, message.binding)) return socket.terminate();
       runtime = options.openRuntime(
         (event) => {
-          if (admitted) send({ kind: "event", event });
+          if (!admitted) return;
+          if (event.type === "plugin" && event.event.type === "pluginNotification" && !(negotiatePush && admitted.push)) return;
+          if (event.type === "browserAction" && !(negotiateBrowser && admitted.browser)) return;
+          send({ kind: "event", event });
         },
         lifetime.signal,
         binding,
@@ -216,6 +242,13 @@ async function handleChannel(
             kind: "bound",
             binding,
             ...(negotiateRestart && opened.restartRuntime ? { restartRuntime: true } : {}),
+            ...(negotiateWorkspaceOperations && opened.workspaceOperations
+              ? { workspaceOperations: true }
+              : {}),
+            ...(negotiateDictation && opened.dictation ? { dictation: true } : {}),
+            ...(negotiateVoice && opened.voice ? { voice: true } : {}),
+            ...(negotiatePush && opened.push ? { push: true } : {}),
+            ...(negotiateBrowser && opened.browser ? { browser: true } : {}),
           });
         },
         () => socket.terminate(),
@@ -225,7 +258,19 @@ async function handleChannel(
     if (!admitted || inflight.has(message.id) || inflight.size >= EXECUTION_MAX_CALLS)
       return socket.terminate();
     const { operation, id } = message;
-    if (reset) {
+    if (VOICE_OPERATION_KINDS.has(operation.kind) && !(negotiateVoice && admitted.voice)) {
+      send({ kind: "error", id, code: "worker_voice_unsupported" });
+      return;
+    }
+    if (PUSH_OPERATION_KINDS.has(operation.kind) && !(negotiatePush && admitted.push)) {
+      send({ kind: "error", id, code: "worker_push_unsupported" });
+      return;
+    }
+    if (BROWSER_OPERATION_KINDS.has(operation.kind) && !(negotiateBrowser && admitted.browser)) {
+      send({ kind: "error", id, code: "worker_browser_unsupported" });
+      return;
+    }
+    if (reset && operation.kind !== "voiceAgentResult") {
       send({ kind: "error", id, code: "worker_restarting" });
       return;
     }

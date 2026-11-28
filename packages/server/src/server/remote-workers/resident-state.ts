@@ -5,6 +5,12 @@ import { WorkerOperationError, type WorkerOperation } from "./execution-protocol
 
 type StateOperation = Extract<WorkerOperation, { path: string }>;
 const directories = new Set(["agents", "creations", "agent-requests"]);
+const registryFiles = new Set([
+  "projects/projects.json",
+  "projects/workspaces.json",
+  "projects/workspace-labels.json",
+  "projects/workspace-labels.transaction.json",
+]);
 function missing(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === "ENOENT";
 }
@@ -15,11 +21,9 @@ export async function openResidentState(paseoHome: string) {
     const parts = operation.path.split("/");
     if (
       (!directories.has(parts[0] ?? "") &&
-        !(
-          (operation.kind === "readState" && operation.path === "projects/projects.json") ||
-          ((operation.kind === "readState" || operation.kind === "writeState") &&
-            operation.path === "projects/workspaces.json")
-        )) ||
+        !((operation.kind === "readState" || operation.kind === "writeState") &&
+          registryFiles.has(operation.path)) &&
+        !(operation.kind === "deleteState" && operation.path === "projects/workspace-labels.transaction.json")) ||
       parts.length > 3 ||
       parts.some((part) => !part || part === "." || part === ".." || /[\\:\0]/.test(part))
     ) {

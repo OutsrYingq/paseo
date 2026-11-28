@@ -164,7 +164,7 @@ async function headerSessionIdMatches(filePath: string, sessionId: string): Prom
   return parseSessionHeaderFromChunk(headChunk)?.sessionId === sessionId;
 }
 
-async function resolveOmpSessionsDir(options: OmpSessionDescriptorOptions): Promise<string> {
+export async function resolveOmpSessionsDir(options: OmpSessionDescriptorOptions): Promise<string> {
   const env = { ...(options.env ?? process.env), ...options.runtimeSettings?.env };
   const homeDir = options.homeDir ?? homedir();
   const baseDir = options.cwd ?? process.cwd();

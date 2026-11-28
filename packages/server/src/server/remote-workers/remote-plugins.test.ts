@@ -1,11 +1,17 @@
 ﻿import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import type { ProviderInput, ProviderPersistence } from "@getpaseo/plugin/server/provider";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
+import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import pino from "pino";
 import { expect, it, vi } from "vitest";
+import { runGitCommand } from "../../utils/run-git-command.js";
 import { PluginAgentClientRegistry } from "../agent/plugin-provider.js";
+import { createRemotePluginSession } from "./remote-plugin-session.js";
 import {
   createResidentPluginHost,
   RemotePluginClient,
@@ -507,5 +513,207 @@ it("keeps native plugin turns across channel loss and scopes bundles, RPC and re
     await Promise.all(cleanups.map((cleanup) => cleanup()));
     vi.unstubAllEnvs();
     await rm(tmp, { recursive: true, force: true });
+  }
+}, 60_000);
+
+it("browses and installs resident registry pins, then applies only the reviewed update", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "paseo-remote-plugin-source-"));
+  const repo = path.join(root, "repository");
+  const home = path.join(root, "resident");
+  const remote = pathToFileURL(repo).href;
+  const id = "fixture/source";
+  const authorization = "Bearer resident-fixture";
+  const intents: Array<string | string[] | undefined> = [];
+  let commit = "";
+  let base = "";
+  const registry = createServer((req, res) => {
+    if (req.headers.authorization !== authorization) {
+      res.writeHead(401).end();
+      return;
+    }
+    const listing = {
+      id,
+      name: "Source fixture",
+      description: "Reviewed Git plugin",
+      categories: [],
+      author: { github: "fixture" },
+      repository: { url: "https://example.test/fixture/source" },
+      artifact: { kind: "git", remote, commit },
+      media: [],
+      submittedAt: "2026-01-01",
+      reviewedAt: "2026-01-01",
+      updatedAt: "2026-01-01",
+      publishedAt: "2026-01-01",
+    };
+    if (req.url === "/index.json") {
+      res.end(JSON.stringify({
+        schemaVersion: 1,
+        registry: { name: "Fixture", url: base },
+        categories: [],
+        plugins: [listing],
+        featured: [id],
+        generatedAt: "2026-01-01",
+      }));
+    } else if (req.url === `/plugins/${id}.json`) {
+      intents.push(req.headers["x-paseo-install"]);
+      res.end(JSON.stringify({ ...listing, readme: "# Resident registry" }));
+    } else {
+      res.writeHead(404).end();
+    }
+  });
+
+  const controller = new AbortController();
+  let closeHost: (() => Promise<void>) | undefined;
+  try {
+    await mkdir(repo);
+    await mkdir(home);
+    const git = (args: string[]) => runGitCommand(args, { cwd: repo });
+    await git(["init"]);
+    const publish = async (marker: string) => {
+      await writeFile(path.join(repo, "paseo-plugin.json"), JSON.stringify({
+        id: "source-fixture",
+        requirements: { paseo: ">=0.18.0" },
+        build: [[process.execPath, "-e", `require("node:fs").writeFileSync("built", "${marker}")`]],
+      }));
+      await writeFile(path.join(repo, "index.client.ts"), "export default () => {};\n");
+      await git(["add", "."]);
+      await git([
+        "-c", "user.name=Paseo Fixture",
+        "-c", "user.email=fixture@example.test",
+        "-c", "commit.gpgsign=false",
+        "commit", "-m", marker,
+      ]);
+      commit = (await git(["rev-parse", "HEAD"])).stdout.trim();
+      return commit;
+    };
+    const installedCommit = await publish("installed");
+    const listening = once(registry, "listening");
+    registry.listen(0, "127.0.0.1");
+    await listening;
+    const address = registry.address();
+    if (!address || typeof address === "string") throw new Error("Missing fixture registry address");
+    const registryHost = `127.0.0.1:${address.port}`;
+    base = `http://${registryHost}`;
+    vi.stubEnv("PASEO_PLUGIN_REGISTRY", base);
+    await writeFile(path.join(home, "config.json"), JSON.stringify({
+      pluginsEnabled: false,
+      pluginRegistries: { [registryHost]: { authorization } },
+    }));
+    const scope = { workerId: "fixture", podUid: randomUUID() };
+    const host = createResidentPluginHost({
+      scope,
+      paseoHome: home,
+      daemonVersion: "0.18.0",
+      logger: pino({ level: "silent" }),
+    });
+    closeHost = host.close;
+    const signal = controller.signal;
+    const resident = host.openChannel({ scope, signal, publish: (event) => client.onEvent(event) });
+    const client = new RemotePluginClient({
+      scope,
+      signal,
+      async call(operation) {
+        const wire = JSON.stringify(operation);
+        expect(wire).not.toContain(authorization);
+        const result = await resident.execute(RemotePluginOperationSchema.parse(JSON.parse(wire)));
+        const reply = JSON.stringify(result);
+        expect(reply).not.toContain(authorization);
+        return JSON.parse(reply);
+      },
+      async attachPluginSocket() {
+        throw new Error("The disabled fixture plugin must not attach a session");
+      },
+    });
+    const responses: SessionOutboundMessage[] = [];
+    const session = createRemotePluginSession({
+      client, signal, supportsBinary: false,
+      send(message) { if (message.type !== "status") responses.push(message); },
+      sendBinary() { throw new Error("Unexpected binary frame"); },
+      canReceive: () => true,
+    });
+    const request = async (message: SessionInboundMessage) => {
+      expect(await session.handle(message)).toBe(true);
+      return responses.pop();
+    };
+
+    await expect(request({
+      type: "plugin.directory.inspect.request", requestId: "inspect", path: repo,
+    })).resolves.toEqual({
+      type: "plugin.directory.inspect.response",
+      payload: { requestId: "inspect", id: "source-fixture" },
+    });
+    await expect(request({
+      type: "plugin.registry.list.request", requestId: "gallery",
+    })).resolves.toMatchObject({
+      type: "plugin.registry.list.response",
+      payload: { requestId: "gallery", index: { featured: [id], plugins: [{ id }] } },
+    });
+    await expect(request({
+      type: "plugin.registry.get.request", requestId: "detail", id,
+    })).resolves.toMatchObject({
+      type: "plugin.registry.get.response",
+      payload: { requestId: "detail", plugin: { id, readme: "# Resident registry" } },
+    });
+    const installed = await request({
+      type: "plugin.source.install.request", requestId: "install", source: id,
+    });
+    if (installed?.type !== "plugin.source.install.response")
+      throw new Error(`Expected installation: ${JSON.stringify(installed)}`);
+    const plugin = installed.payload.plugin;
+    expect(plugin.installation?.currentRevision).toBe(installedCommit);
+    expect(await readFile(path.join(plugin.path, "built"), "utf8")).toBe("installed");
+    expect(intents.splice(0)).toEqual([undefined, "1"]);
+
+    const updateCommit = await publish("updated");
+    await expect(request({
+      type: "plugin.source.status.request", requestId: "status", pluginId: plugin.id,
+    })).resolves.toMatchObject({
+      type: "plugin.source.status.response",
+      payload: { plugins: [{
+        id: plugin.id, currentCommit: installedCommit, latestCommit: updateCommit, updateAvailable: true,
+      }] },
+    });
+    await expect(request({
+      type: "plugin.source.update.request", requestId: "legacy-update", pluginId: plugin.id,
+    })).resolves.toEqual({
+      type: "rpc_error",
+      payload: {
+        requestId: "legacy-update",
+        requestType: "plugin.source.update.request",
+        code: "handler_error",
+        error: "Request failed: Update the client to review plugin updates before applying them.",
+      },
+    });
+    const preview = await request({
+      type: "plugin.source.update.preview.request", requestId: "preview", pluginId: plugin.id,
+    });
+    const proposal = preview?.type === "plugin.source.update.preview.response"
+      ? preview.payload.plugins[0]?.proposal
+      : undefined;
+    if (!proposal) throw new Error(`Expected reviewed update: ${JSON.stringify(preview)}`);
+    expect(proposal.target).toEqual({ kind: "git", commit: updateCommit });
+    const apply = () => request({
+      type: "plugin.source.update.apply.request", requestId: "apply", proposals: [proposal],
+    });
+    const applied = await apply();
+    const updated = applied?.type === "plugin.source.update.apply.response"
+      ? applied.payload.plugins[0]?.plugin
+      : undefined;
+    if (!updated) throw new Error(`Expected applied update: ${JSON.stringify(applied)}`);
+    expect(updated.installation?.currentRevision).toBe(updateCommit);
+    expect(await readFile(path.join(updated.path, "built"), "utf8")).toBe("updated");
+    await expect(apply()).resolves.toMatchObject({
+      type: "plugin.source.update.apply.response",
+      payload: { plugins: [{ id: plugin.id, outcome: "error" }] },
+    });
+    session.close();
+  } finally {
+    controller.abort();
+    await closeHost?.();
+    const closed = Promise.withResolvers<void>();
+    registry.close(() => closed.resolve());
+    await closed.promise;
+    vi.unstubAllEnvs();
+    await rm(root, { recursive: true, force: true });
   }
 }, 60_000);

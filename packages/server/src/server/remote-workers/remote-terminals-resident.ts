@@ -85,6 +85,7 @@ export function createResidentTerminals(options: ResidentTerminalOptions = {}) {
   });
 
   return {
+    manager,
     registerCwdEnv: manager.registerCwdEnv,
     killAll,
     open(publish: (event: RemoteTerminalEvent) => void, signal: AbortSignal) {

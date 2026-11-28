@@ -2401,18 +2401,19 @@ export class OmpAgentClient implements AgentClient {
     config: AgentSessionConfig,
     launch: Pick<OmpStartSessionInput, "env" | "wrap">,
   ): Promise<OmpHostToolRouter | undefined> {
-    if (this.executionIsRemote) return undefined;
-    if (!catalog && !config.mcpServers) {
+    if (this.executionIsRemote ? !catalog?.tools.size : !catalog && !config.mcpServers) {
       return;
     }
-    // Paseo starts stdio MCP servers for OMP, so they run behind the agent's wrap as OMP does.
-    const bridge = await OmpMcpBridge.connect({
-      servers: config.mcpServers,
-      cwd: config.cwd,
-      logger: this.logger,
-      env: { ...process.env, ...this.runtimeSettings?.env, ...launch.env },
-      wrap: launch.wrap,
-    });
+    // Remote sessions can use the host catalog, but never open MCP servers on Central.
+    const bridge = this.executionIsRemote
+      ? undefined
+      : await OmpMcpBridge.connect({
+          servers: config.mcpServers,
+          cwd: config.cwd,
+          logger: this.logger,
+          env: { ...process.env, ...this.runtimeSettings?.env, ...launch.env },
+          wrap: launch.wrap,
+        });
     const router = new OmpHostToolRouter({ runtimeSession, catalog, bridge, logger: this.logger });
     try {
       await router.register();

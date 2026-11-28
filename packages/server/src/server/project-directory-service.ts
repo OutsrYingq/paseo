@@ -31,10 +31,12 @@ interface ProjectDirectoryFileSystem {
   rmdir(path: string): Promise<void>;
 }
 
-interface CreateProjectDirectoryDependencies {
-  filesystem?: ProjectDirectoryFileSystem;
+type CreateProjectDirectoryDependencies = {
   registerProject(directoryPath: string): Promise<PersistedProjectRecord>;
-}
+} & (
+  | { filesystem?: ProjectDirectoryFileSystem; resolveParent?: undefined }
+  | { filesystem: Omit<ProjectDirectoryFileSystem, "stat">; resolveParent: (path: string) => Promise<string> }
+);
 
 const nodeProjectDirectoryFileSystem: ProjectDirectoryFileSystem = {
   stat,
@@ -57,7 +59,9 @@ export async function createProjectDirectory(
       "Parent directory is required",
     );
   }
-  const parentDirectory = resolve(expandTilde(requestedParentPath));
+  const parentDirectory = dependencies.resolveParent
+    ? await dependencies.resolveParent(requestedParentPath)
+    : resolve(expandTilde(requestedParentPath));
   const directoryPath = resolve(parentDirectory, input.name);
   if (!isPathInside(parentDirectory, directoryPath)) {
     throw new ProjectDirectoryRequestError(
@@ -67,7 +71,9 @@ export async function createProjectDirectory(
   }
 
   const filesystem = dependencies.filesystem ?? nodeProjectDirectoryFileSystem;
-  await requireExistingParent(filesystem, parentDirectory);
+  if (!dependencies.resolveParent) {
+    await requireExistingParent(dependencies.filesystem ?? nodeProjectDirectoryFileSystem, parentDirectory);
+  }
 
   try {
     await filesystem.mkdir(directoryPath);

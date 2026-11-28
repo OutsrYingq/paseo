@@ -8,18 +8,29 @@ import type { WorkspaceRegistry } from "../workspace-registry.js";
 import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 import type { AgentCreateRequest, SendAgentMessageRequest } from "@getpaseo/protocol/messages";
-import { AgentManager, type AgentManagerOptions } from "../agent/agent-manager.js";
+import { AgentManager, type AgentManagerEvent, type AgentManagerOptions } from "../agent/agent-manager.js";
 import { buildStoredAgentPayload } from "../agent/agent-projections.js";
 import {
-  sendPreparedPromptToAgent,
+  sendPromptToAgent,
   unarchiveAgentState,
   waitForAgentRunStartWithTimeout,
 } from "../agent/agent-prompt.js";
+import { createManagerMessageDelivery } from "../agent/agent-messages/manager-delivery.js";
+import type { AgentMessageBehavior } from "../agent/agent-messages/index.js";
+import { createCentralWorkspaceArchive } from "./central-workspace-archive.js";
 import type { AgentClient } from "../agent/agent-sdk-types.js";
-import { archiveAgentCommand, cancelAgentRunCommand } from "../agent/lifecycle-command.js";
+import { resolveCreateAgentTitles } from "../agent/create-agent-title.js";
+import {
+  archiveAgentCommand,
+  cancelAgentRunCommand,
+  setAgentModeCommand,
+  updateAgentCommand,
+} from "../agent/lifecycle-command.js";
 import { AgentStorage } from "../agent/agent-storage.js";
+import { respondToAgentPermission } from "../agent/permission-response.js";
 import { buildAgentPrompt } from "../agent/prompt-attachments.js";
 import { ProviderSnapshotManager } from "../agent/provider-snapshot-manager.js";
+import { PROVIDER_BACKGROUND_REFRESH_INTERVAL_MS } from "../agent/provider-refresh-schedule.js";
 import { shutdownAgentClients } from "../agent/provider-registry.js";
 import { CreationService } from "../creation/index.js";
 import { MessageReceipts } from "../message-receipts/index.js";
@@ -29,17 +40,35 @@ import {
   isStoredAgentProviderAvailable,
   toAgentPersistenceHandle,
 } from "../persistence-hooks.js";
-import { WorkerOperationError } from "./execution-protocol.js";
+import { WorkerOperationError, type WorkerEvent } from "./execution-protocol.js";
 import type { createRemoteState } from "./remote-state.js";
-import { ensureAgentLoaded } from "../agent/agent-loading.js";
+import type { createRemoteFileTransfer } from "./remote-file-transfer.js";
+import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "../agent/agent-loading.js";
+import { AgentConfigSession } from "../session/agent-config/agent-config-session.js";
+import { createCentralHistory } from "./central-history.js";
+import { listAgentCommands } from "../session/agent-config/list-agent-commands.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/protocol/messages";
+import {
+  handleAgentOrchestrationRequest,
+  projectProviderSubagentUpdate,
+  readBackgroundWorkUpdate,
+} from "../session/agent-history/agent-orchestration.js";
+import { wrapSpokenInput } from "../voice-config.js";
+import { PASEO_MCP_SERVER_NAME } from "../agent/runtime-mcp-config.js";
 
 export type CentralTimelineUpdate = Extract<
   SessionOutboundMessage,
   { type: "agent_stream" | "agent.timeline.replacement" }
 >;
+export type CentralOrchestrationEvent = Extract<
+  AgentManagerEvent,
+  { type: "provider_subagent" | "background_work" }
+>;
+
+type ResolveAttachments = ReturnType<typeof createRemoteFileTransfer>["resolveAttachments"];
 
 export interface CentralAgentOptions {
+  serverId: string;
   state: ReturnType<typeof createRemoteState>;
   logger: Logger;
   createClients(): Promise<Record<string, AgentClient>>;
@@ -48,7 +77,7 @@ export interface CentralAgentOptions {
 
 export async function openCentralAgents(
   options: CentralAgentOptions,
-  publish: (event: CentralTimelineUpdate) => void,
+  publish: (event: CentralTimelineUpdate | CentralOrchestrationEvent) => void,
   signal: AbortSignal,
 ) {
   const { logger, state } = options;
@@ -60,14 +89,19 @@ export async function openCentralAgents(
     extraClients: clients,
     executionOnly: true,
     resolveCwd: (cwd) => cwd,
+    backgroundRefresh: { intervalMs: PROVIDER_BACKGROUND_REFRESH_INTERVAL_MS },
   });
+  type VoiceRuntime = NonNullable<ReturnType<NonNullable<AgentManagerOptions["resolveVoiceRuntime"]>>>;
+  const voiceRuntime = new Map<string, VoiceRuntime>();
   const manager = new AgentManager({
     ...options.manager,
     logger,
     clients,
     registry: storage,
+    resolveVoiceRuntime: (agentId) => voiceRuntime.get(agentId),
   });
   const dependencies = { logger, agentManager: manager, agentStorage: storage };
+  const agentMessages = createManagerMessageDelivery({ ...dependencies, signal });
   const detachStorage = attachAgentStoragePersistence(logger, manager, storage);
   const receiptsDirectory = "agent-requests";
   const receipts = new MessageReceipts(receiptsDirectory, state.receipts);
@@ -84,6 +118,10 @@ export async function openCentralAgents(
   const stopEvents = manager.subscribe(
     (event) => {
       if (signal.aborted) return;
+      if (event.type === "provider_subagent" || event.type === "background_work") {
+        publish(event);
+        return;
+      }
       if (event.type === "timeline_replacement") {
         publish({
           type: "agent.timeline.replacement",
@@ -113,14 +151,22 @@ export async function openCentralAgents(
       throw new WorkerOperationError("worker_connection_lost");
   }
 
+  function snapshotAgent(
+    agent: NonNullable<ReturnType<AgentManager["getAgent"]>>,
+    stored: Awaited<ReturnType<AgentStorage["get"]>>,
+  ) {
+    let title = stored?.title;
+    if (!title && (stored?.persistence || agent.lastUserMessageAt)) {
+      const prompt = manager.getTimeline(agent.id).find((item) => item.type === "user_message");
+      title = resolveCreateAgentTitles({ initialPrompt: prompt?.text }).provisionalTitle;
+    }
+    return serializeAgentSnapshot(agent, { title, archivedAt: stored?.archivedAt });
+  }
+
   async function readAgent(id: string) {
     const live = manager.getAgent(id);
     const stored = await storage.get(id);
-    if (live)
-      return serializeAgentSnapshot(live, {
-        title: stored?.title,
-        archivedAt: stored?.archivedAt,
-      });
+    if (live) return snapshotAgent(live, stored);
     if (!stored) return null;
     return buildStoredAgentPayload(stored, manager.getRegisteredProviderIds(), (provider, own) => {
       return clients[provider]?.effectiveOptions?.(own) ?? own ?? {};
@@ -137,21 +183,32 @@ export async function openCentralAgents(
       activeTurnBehavior?: SendAgentMessageRequest["activeTurnBehavior"];
       messageId?: string;
     },
-    request?: AbortSignal,
+    request: AbortSignal | undefined,
     beforeDispatch?: () => Promise<void>,
   ) {
-    const dispatch = await sendPreparedPromptToAgent({
+    const dispatch = await sendPromptToAgent({
       ...dependencies,
+      agentMessages,
       agentId,
       prompt: buildAgentPrompt(input.text, input.images, input.attachments),
+      messageId: input.messageId,
+      clearPendingPermissions: true,
       sessionMode: input.sessionMode,
-      activeTurnBehavior:
-        input.activeTurnBehavior === "queue" ? undefined : input.activeTurnBehavior,
+      activeTurnBehavior: input.activeTurnBehavior === "steer" ? "steer" : "interrupt",
       runOptions: { clientMessageId: input.messageId },
       admit: () => !signal.aborted && !request?.aborted,
       beforeDispatch: async () => {
         requireActive(request);
         await beforeDispatch?.();
+        requireActive(request);
+        const { provisionalTitle } = resolveCreateAgentTitles({ initialPrompt: input.text });
+        if (provisionalTitle) {
+          const stored = await storage.get(agentId);
+          requireActive(request);
+          if (stored && !stored.title && !stored.lastUserMessageAt) {
+            await manager.setTitle(agentId, provisionalTitle);
+          }
+        }
         requireActive(request);
       },
     });
@@ -181,8 +238,11 @@ export async function openCentralAgents(
     input: AgentCreateRequest,
     agentId: string,
     onReady: (agent: AgentSnapshotPayload) => Promise<void>,
+    resolveAttachments: ResolveAttachments,
     requestSignal?: AbortSignal,
   ) {
+    requireActive(requestSignal);
+    const attachments = await resolveAttachments(input.attachments, requestSignal);
     requireActive(requestSignal);
     const hasPrompt = Boolean(
       input.initialPrompt || input.images?.length || input.attachments?.length,
@@ -194,15 +254,19 @@ export async function openCentralAgents(
       metadata: input.metadata,
       env: input.env,
     });
-    await storage.applySnapshot(agent);
-    await onReady(serializeAgentSnapshot(agent));
+    const { provisionalTitle } = resolveCreateAgentTitles({
+      configTitle: input.config.title,
+      initialPrompt: input.initialPrompt,
+    });
+    await storage.applySnapshot(agent, { title: provisionalTitle });
+    await onReady(serializeAgentSnapshot(agent, { title: provisionalTitle }));
     if (hasPrompt) {
       await sendPrompt(
         agent.id,
         {
           text: input.initialPrompt ?? "",
           images: input.images,
-          attachments: input.attachments,
+          attachments,
           messageId: input.clientMessageId,
         },
         requestSignal,
@@ -214,7 +278,7 @@ export async function openCentralAgents(
     };
   }
 
-  async function createAgent(input: AgentCreateRequest, requestSignal?: AbortSignal) {
+  async function createAgent(input: AgentCreateRequest, requestSignal: AbortSignal, resolveAttachments: ResolveAttachments) {
     requireActive(requestSignal);
     validateAgentCreation(input);
     const { idempotencyKey, requestId: _requestId, subscribe: _subscribe, ...request } = input;
@@ -230,7 +294,7 @@ export async function openCentralAgents(
       agentId: input.agentId,
       exists: async (kind, id) => kind === "agent" && Boolean(await storage.get(id)),
       readAgent,
-      createAgent: (id, _workspace, onReady) => launchAgent(input, id, onReady, requestSignal),
+      createAgent: (id, _workspace, onReady) => launchAgent(input, id, onReady, resolveAttachments, requestSignal),
     });
   }
 
@@ -244,6 +308,7 @@ export async function openCentralAgents(
     },
     input: WorkspaceCreateRequest,
     requestSignal: AbortSignal,
+    resolveAttachments: ResolveAttachments,
     observe?: (snapshot: CreationSnapshot) => void,
   ) {
     requireActive(requestSignal);
@@ -253,7 +318,7 @@ export async function openCentralAgents(
       ...input.agent,
       type: "agent.create.request" as const,
       requestId,
-      config: { ...input.agent.config, cwd: prepared.agentCwd! },
+      config: { ...input.agent.config, cwd: prepared.agentCwd ?? input.agent.config.cwd },
     };
     if (agent) validateAgentCreation(agent);
     return creations.create(
@@ -276,8 +341,17 @@ export async function openCentralAgents(
           return prepared.provision(id);
         },
         createAgent: agent
-          ? (id, workspace, onReady) =>
-              launchAgent({ ...agent, workspaceId: workspace?.id }, id, onReady, requestSignal)
+          ? (id, workspace, onReady) => {
+              const cwd = prepared.agentCwd ?? workspace?.workspaceDirectory;
+              if (!cwd) throw new WorkerOperationError("worker_agent_directory_outside_workspace");
+              return launchAgent(
+                { ...agent, config: { ...agent.config, cwd }, workspaceId: workspace?.id },
+                id,
+                onReady,
+                resolveAttachments,
+                requestSignal,
+              );
+            }
           : undefined,
       },
       observe,
@@ -286,27 +360,66 @@ export async function openCentralAgents(
 
   async function sendMessage(
     input: SendAgentMessageRequest,
-    requestSignal?: AbortSignal,
-  ): Promise<null> {
+    requestSignal: AbortSignal,
+    resolveAttachments: ResolveAttachments,
+    modernTurnBehavior: boolean,
+  ) {
     requireActive(requestSignal);
     if (!input.messageId) throw new WorkerOperationError("worker_message_id_required");
-    if (input.sourceAgentServerId || input.sourceAgentId || input.activeTurnBehavior === "queue") {
+    if (input.sourceAgentServerId && input.sourceAgentServerId !== options.serverId) {
       throw new WorkerOperationError("worker_message_source_unsupported");
+    }
+    if (input.sourceAgentId && !(await readAgent(input.sourceAgentId))) {
+      throw new WorkerOperationError("agent_message_source_not_found");
+    }
+    if (!input.sourceAgentId && input.activeTurnBehavior === "queue") {
+      throw new WorkerOperationError("agent_message_queue_requires_source");
     }
     const request = {
       prompt: buildAgentPrompt(input.text, input.images, input.attachments),
       sourceAgentId: input.sourceAgentId,
       sourceAgentServerId: input.sourceAgentServerId,
       sessionMode: input.sessionMode,
-      activeTurnBehavior: input.activeTurnBehavior ?? "interrupt",
+      activeTurnBehavior: input.activeTurnBehavior ?? (input.sourceAgentId ? "steer" : "interrupt"),
     };
+    type Admission = { activeTurnBehavior: AgentMessageBehavior; guidance: string };
+    let admit!: (receipt: Admission) => void;
+    const admitted = new Promise<Admission>((resolve) => { admit = resolve; });
     try {
-      await receipts.send({
+      const sent = receipts.send({
         agentId: input.agentId,
         messageId: input.messageId,
         request,
-        send: (beforeDispatch) => sendPrompt(input.agentId, input, requestSignal, beforeDispatch),
+        send: async (beforeDispatch) => {
+          const attachments = await resolveAttachments(input.attachments, requestSignal);
+          if (input.sourceAgentId) {
+            requireActive(requestSignal);
+            await beforeDispatch();
+            requireActive(requestSignal);
+            const behavior = input.activeTurnBehavior;
+            const receipt = agentMessages.enqueue({
+              recipientId: input.agentId,
+              messageId: input.messageId,
+              prompt: buildAgentPrompt(input.text, input.images, attachments),
+              source: {
+                kind: "agent-message",
+                agentId: input.sourceAgentId,
+                serverId: input.sourceAgentServerId,
+                title: manager.getAgent(input.sourceAgentId)?.config.title ?? undefined,
+              },
+              activeTurnBehavior: modernTurnBehavior ? behavior ?? "queue" :
+                behavior === "interrupt" ? "interrupt" : "queue",
+              sessionMode: input.sessionMode,
+              clearPendingPermissions: false,
+            });
+            admit({ activeTurnBehavior: receipt.activeTurnBehavior, guidance: receipt.guidance });
+            await receipt.dispatched;
+            return;
+          }
+          return sendPrompt(input.agentId, { ...input, attachments }, requestSignal, beforeDispatch);
+        },
       });
+      return await Promise.race([sent, admitted]);
     } catch (error) {
       if (
         error instanceof Error &&
@@ -317,7 +430,6 @@ export async function openCentralAgents(
       logger.warn({ err: error, agentId: input.agentId }, "Worker prompt dispatch failed");
       throw error;
     }
-    return null;
   }
 
   let closing: Promise<void> | undefined;
@@ -325,6 +437,7 @@ export async function openCentralAgents(
     return (closing ??= (async () => {
       catalog.destroy();
       stopEvents();
+      await agentMessages.close();
       manager.prepareForShutdown();
       const closed = await Promise.allSettled(
         manager.listAgents({ includeInternal: true }).map((agent) => manager.closeAgent(agent.id)),
@@ -352,11 +465,138 @@ export async function openCentralAgents(
     timelineHead: (agentId: string) => manager.getLoadedTimelineHead(agentId),
     manager,
     catalog,
+    createOrchestrationSession(
+      client: Pick<Parameters<typeof handleAgentOrchestrationRequest>[0], "authorization" | "supports">,
+    ) {
+      const deps = { ...dependencies, ...client };
+      return {
+        dispatch: (request: Parameters<typeof handleAgentOrchestrationRequest>[1]) =>
+          handleAgentOrchestrationRequest(deps, request),
+        projectProviderSubagentUpdate: (event: Extract<CentralOrchestrationEvent, { type: "provider_subagent" }>["event"]) =>
+          projectProviderSubagentUpdate({ ...deps, event }),
+        backgroundWorkUpdate: (agentId: string) => readBackgroundWorkUpdate(deps, agentId),
+      };
+    },
+    createArchiveSession(
+      options: Omit<Parameters<typeof createCentralWorkspaceArchive>[0],
+        "agentManager" | "agentStorage" | "logger" | "unarchiveAgent">,
+    ) {
+      return createCentralWorkspaceArchive({
+        ...dependencies,
+        ...options,
+        unarchiveAgent: (id) => unarchiveAgentState(storage, manager, id),
+      });
+    },
+    createHistorySession(
+      workspaceProvisioning: Parameters<typeof createCentralHistory>[0]["workspaceProvisioning"],
+    ) {
+      return createCentralHistory({
+        ...dependencies,
+        providerSnapshotManager: catalog,
+        workspaceProvisioning,
+        agentPayload: async (snapshot) => snapshotAgent(snapshot, await storage.get(snapshot.id)),
+      });
+    },
     createAgent,
     createWorkspace,
     sendMessage,
+    listCommands(
+      request: Extract<SessionInboundMessage, { type: "list_commands_request" }>,
+      resolveCwd: (cwd: string) => string | Promise<string>,
+    ) {
+      requireActive();
+      return listAgentCommands(request, { ...dependencies, resolveCwd });
+    },
     cancelAgent: (id: string) => cancelAgentRunCommand(dependencies, id),
     archiveAgent: (id: string) => archiveAgentCommand(dependencies, id),
+    async executeVoiceAction(
+      agentId: string,
+      action: Extract<WorkerEvent, { type: "voiceAgentAction" }>["action"],
+      request: AbortSignal | undefined,
+    ) {
+      requireActive(request);
+      const record = await storage.get(agentId);
+      requireActive(request);
+      if (record?.internal || record?.archivedAt || manager.getAgent(agentId)?.internal) {
+        throw new WorkerOperationError("agent_not_found");
+      }
+      switch (action.kind) {
+        case "load": {
+          const agent = await ensureUnarchivedAgentLoaded(agentId, dependencies);
+          if (agent.config.mcpServers?.[PASEO_MCP_SERVER_NAME]) {
+            throw new WorkerOperationError("The agent already has a custom paseo MCP server");
+          }
+          return agent.config.systemPrompt ?? null;
+        }
+        case "reload": {
+          if (action.restore) {
+            if (!voiceRuntime.delete(agentId)) return agentId;
+            if (!manager.getAgent(agentId)) return agentId;
+            return (await manager.reloadAgentSession(agentId)).id;
+          }
+          if (!action.speakMcp || action.systemPrompt === null) {
+            throw new WorkerOperationError("worker_voice_mcp_unavailable");
+          }
+          voiceRuntime.set(agentId, {
+            systemPrompt: action.systemPrompt,
+            mcpBaseUrl: action.speakMcp.url,
+            mcpAuthToken: action.speakMcp.token,
+          });
+          try {
+            return (await manager.reloadAgentSession(agentId)).id;
+          } catch (error) {
+            voiceRuntime.delete(agentId);
+            throw error;
+          }
+        }
+        case "submit":
+          await sendPrompt(agentId, { text: wrapSpokenInput(action.text) }, request);
+          return null;
+        case "interrupt":
+          if (manager.hasInFlightRun(agentId)) await cancelAgentRunCommand(dependencies, agentId);
+          return null;
+        case "hasActiveRun":
+          return manager.hasInFlightRun(agentId);
+      }
+    },
+    async releaseVoiceRuntime(agentId: string) {
+      if (!voiceRuntime.delete(agentId) || signal.aborted || !manager.getAgent(agentId)) return;
+      await manager.reloadAgentSession(agentId);
+    },
+    async clearAgentAttention(ids: string[]) {
+      requireActive();
+      for (const id of ids) {
+        if (!manager.getAgent(id) && !(await storage.get(id))) {
+          throw new WorkerOperationError("agent_not_found");
+        }
+      }
+      requireActive();
+      await Promise.all(ids.map((id) => manager.clearAgentAttention(id)));
+    },
+    respondToPermission(
+      input: Extract<SessionInboundMessage, { type: "agent_permission_response" }>,
+    ) {
+      requireActive();
+      return respondToAgentPermission({ ...input, agentManager: manager, logger });
+    },
+    updateAgent: (input: Extract<SessionInboundMessage, { type: "update_agent_request" }>) =>
+      updateAgentCommand(dependencies, input),
+    createAgentConfigSession(emit: (message: SessionOutboundMessage) => void) {
+      return new AgentConfigSession({
+        host: { emit },
+        logger,
+        operations: {
+          ensureLoaded: async (agentId) => {
+            await ensureUnarchivedAgentLoaded(agentId, dependencies);
+          },
+          setMode: async (agentId, modeId) =>
+            (await setAgentModeCommand(dependencies, { agentId, modeId })).notice,
+          setModel: (agentId, modelId) => manager.setAgentModel(agentId, modelId),
+          setOptions: (agentId, patch) => manager.setAgentOptions(agentId, patch),
+          setThinking: (agentId, optionId) => manager.setAgentThinkingOption(agentId, optionId),
+        },
+      });
+    },
     async refreshAgent(agentId: string, request: AbortSignal) {
       requireActive(request);
       await unarchiveAgentState(storage, manager, agentId);
@@ -411,9 +651,10 @@ export async function openCentralAgents(
         requireActive();
         const agent = await ensureAgentLoaded(agentId, { ...dependencies, purpose: "history" });
         const page = manager.fetchTimeline(agentId, { direction, cursor, limit, wholeTurns });
+        const stored = await storage.get(agentId);
         return {
           ...reply,
-          agent: serializeAgentSnapshot(agent),
+          agent: snapshotAgent(agent, stored),
           epoch: page.epoch,
           window: page.window,
           reset: page.reset,
