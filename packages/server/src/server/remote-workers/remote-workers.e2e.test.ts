@@ -380,6 +380,14 @@ it("imports and rewinds an OMP history through the public SDK", async () => {
   await expect(client.finishDictationStream("same-dictation", 0)).resolves.toMatchObject({
     text: "Resident transcript",
   });
+  const speechConfig = await client.getDaemonConfig();
+  expect(speechConfig.config.features?.dictation).toMatchObject({
+    enabled: true,
+    stt: { provider: "openai", hasApiKey: true },
+  });
+  expect(speechConfig.config.features?.dictation.stt).not.toHaveProperty("apiKey");
+  await client.patchDaemonConfig({ features: { dictation: { enabled: false } } });
+  await expect(client.startDictationStream("disabled-dictation", audioFormat)).rejects.toThrow();
 
   const cwd = path.join(root, "owner");
   const id = randomUUID();

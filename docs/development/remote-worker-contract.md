@@ -41,6 +41,7 @@ Central authorizes public requests and binds subscriptions to their client socke
 - Voice mode uses the same worker speech service. Central binds each voice source to one agent. The resident's loopback `speak` capability is injected into the provider launch only and revoked when the source closes.
 - Agent, terminal, and plugin notifications use the standalone presence and preference rules. The worker stores its own device tokens and delivers pushes with its original `serverId`.
 - Browser tools use one broker per worker. Agent tool calls use Codex's resident MCP connection or OMP's native host tool channel. The resident stores browser tool policy, and Central rejects ambiguous workspace IDs before sending a command to Desktop.
+- Speech settings and model management run on the resident. Central receives the redacted configuration view, and operator-managed speech credentials stay on the resident.
 
 ## Scoped refresh and restart
 
@@ -77,4 +78,4 @@ The Central adapter exports a default `CentralOptions` object. The resident adap
 
 Run the focused worker regression with `npm exec -w @getpaseo/server -- vitest run src/server/remote-workers`. This suite uses the server checkout's SDK (0.18.0) and protocol fixtures for Codex and OMP. The test credentials and plugin bundles are generated locally.
 
-The implemented transport is direct connection over the worker Host. Relay, Hub, service-preview ingress, browser automation, and scheduling require their own integration with the worker identity and lifecycle. Worktree destinations must fall under an admitted resident root. Source installation and checkout operations use the provider and forge configurations on the worker.
+The implemented transport is direct connection over the worker Host. Relay, Hub, service-preview ingress, and scheduling require integration with the worker identity and lifecycle. Worktree destinations must fall under an admitted resident root. Source installation and checkout operations use the provider and forge configurations on the worker.

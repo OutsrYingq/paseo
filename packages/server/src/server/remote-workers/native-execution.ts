@@ -66,6 +66,8 @@ import { createResidentPush } from "./remote-push.js";
 import { createResidentVoiceMcp } from "./resident-voice-mcp.js";
 import { openResidentBrowser } from "./resident-browser.js";
 import { ProviderOverrideSchema } from "../agent/provider-launch-config.js";
+import { createSpeechSettingsOwner } from "../speech/speech-settings.js";
+import { executeResidentSpeechModels } from "./remote-speech-models.js";
 
 interface OwnedProcess {
   child: ChildProcessWithoutNullStreams;
@@ -103,11 +105,17 @@ export interface NativeExecutionOptions {
 
 export function createNativeExecution(options: NativeExecutionOptions) {
   const { providers, logger } = options;
+  let speech: SpeechService | undefined;
   const makeHostSettings = () => createResidentHostSettings({
     paseoHome: options.paseoHome,
     daemonVersion: options.plugins?.daemonVersion,
     logger,
     listNativeProviders,
+    speech: createSpeechSettingsOwner({
+      paseoHome: options.paseoHome,
+      env: process.env,
+      speechService: { reconfigure: (config) => speech?.reconfigure(config) },
+    }),
   });
   let hostSettings = makeHostSettings();
   function readBrowserPolicy(provider: "codex" | "omp") {
@@ -119,7 +127,6 @@ export function createNativeExecution(options: NativeExecutionOptions) {
     return { enabled, providerPolicy: settings.data?.paseoTools };
   }
   let push: ReturnType<typeof createResidentPush> | undefined;
-  let speech: SpeechService | undefined;
   function readSpeechConfig() {
     const resolved = resolveSpeechConfig({
       paseoHome: options.paseoHome,
@@ -509,11 +516,7 @@ export function createNativeExecution(options: NativeExecutionOptions) {
         switch (operation.kind) {
           case "plugin":
             return executePlugin(operation);
-          case "hostSettingsReload": {
-            const result = await hostSettings.execute(operation);
-            if (speech) speech.reconfigure(readSpeechConfig());
-            return result;
-          }
+          case "hostSettingsReload":
           case "hostSettingsGet":
           case "hostSettingsPatch":
           case "hostStatus":
@@ -534,6 +537,8 @@ export function createNativeExecution(options: NativeExecutionOptions) {
           case "voiceClose":
           case "voiceAgentResult":
             return voice.execute(operation);
+          case "speechModels":
+            return executeResidentSpeechModels(operation.request, getSpeech());
           case "pushTokenRenew":
           case "pushTokenRevoke":
           case "pushNotificationSend":

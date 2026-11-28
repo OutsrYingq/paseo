@@ -7,6 +7,7 @@
 } from "@getpaseo/protocol/messages";
 import { z } from "zod";
 import { AgentMetadataGenerationSchema } from "../persisted-config.js";
+import { SpeechSettingsPatchSchema, SpeechSettingsSchema } from "@getpaseo/protocol/speech/rpc-schemas";
 
 // These are the composer controls implemented by the remote native providers.
 const profileControls = z.object({
@@ -20,6 +21,7 @@ const terminalProfile = TerminalProfileSchema.strip();
 const usage = z.strictObject({ enabled: z.boolean() });
 const browserTools = z.strictObject({ enabled: z.boolean() });
 const browserSettings = z.literal(true).optional();
+const speechSettings = z.literal(true).optional();
 
 export const RemoteHostConfigPatchSchema = z.strictObject({
   agentProfiles: z
@@ -36,6 +38,7 @@ export const RemoteHostConfigPatchSchema = z.strictObject({
   usage: usage.optional(),
   metadataGeneration: AgentMetadataGenerationSchema.optional(),
   browserTools: browserTools.optional(),
+  features: SpeechSettingsPatchSchema.optional(),
 });
 
 export const RemoteHostConfigSchema = z.strictObject({
@@ -52,6 +55,7 @@ export const RemoteHostConfigSchema = z.strictObject({
   providers: z.strictObject({}),
   metadataGeneration: AgentMetadataGenerationSchema.required({ providers: true }),
   usage: usage.optional(),
+  features: SpeechSettingsSchema.optional(),
   autoArchiveAfterMerge: z.literal(false),
   enableTerminalAgentHooks: z.literal(false),
   appendSystemPrompt: z.literal(""),
@@ -60,9 +64,9 @@ export const RemoteHostConfigSchema = z.strictObject({
 export type RemoteHostConfig = z.output<typeof RemoteHostConfigSchema>;
 
 export const RemoteHostSettingsOperationSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("hostSettingsGet"), browserSettings }),
-  z.strictObject({ kind: z.literal("hostSettingsPatch"), config: RemoteHostConfigPatchSchema, browserSettings }),
-  z.strictObject({ kind: z.literal("hostSettingsReload"), browserSettings }),
+  z.strictObject({ kind: z.literal("hostSettingsGet"), browserSettings, speechSettings }),
+  z.strictObject({ kind: z.literal("hostSettingsPatch"), config: RemoteHostConfigPatchSchema, browserSettings, speechSettings }),
+  z.strictObject({ kind: z.literal("hostSettingsReload"), browserSettings, speechSettings }),
   z.strictObject({ kind: z.literal("hostStatus"), includeProviders: z.boolean().optional() }),
   z.strictObject({ kind: z.literal("hostDiagnostics") }),
 ]);

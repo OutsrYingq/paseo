@@ -376,6 +376,7 @@ export async function startRemoteCentral(options: CentralOptions) {
           call: (operation) => connection.call(operation),
           serverId: execution.target.serverId,
           browserSettings: connection.supportsBrowser ? true : undefined,
+          speechSettings: connection.supportsVoice ? true : undefined,
           onConfigChanged(event) {
             for (const deliver of audiences.get(execution) ?? []) deliver(event);
           },
@@ -1080,6 +1081,15 @@ export async function startRemoteCentral(options: CentralOptions) {
           return;
         }
         if (isVoiceInput(operation)) return voice.dispatch(operation);
+        if (
+          operation.type === "speech.local_models.list.request" ||
+          operation.type === "speech.local_models.download.request" ||
+          operation.type === "speech.local_models.delete.request"
+        ) {
+          if (!scope.connection.supportsVoice) throw new WorkerOperationError("worker_speech_settings_unsupported");
+          sendAuthorized(await scope.connection.call({ kind: "speechModels", request: operation }));
+          return;
+        }
         const browserRequest = browserSession.dispatch(socket, operation);
         if (browserRequest) return browserRequest;
         if (operation.type === "file.upload.request") return transfers.beginUpload(operation);
@@ -1323,6 +1333,7 @@ export async function startRemoteCentral(options: CentralOptions) {
               usageSources: true,
               usageSetting: true,
             }),
+            ...(scope.connection.supportsVoice && { speechSettings: true }),
             ...(scope.connection.supportsRuntimeRestart &&
             authorization.allowsPermission("daemon.manage")
               ? { terminalsSurviveRestart: true }

@@ -12,16 +12,18 @@ export function createCentralHostSettings({
   serverId,
   onConfigChanged,
   browserSettings,
+  speechSettings,
 }: {
   call: RemoteHostSettingsCall;
   serverId: string;
   browserSettings?: true;
+  speechSettings?: true;
   onConfigChanged?(event: {
     type: "status";
     payload: { status: "daemon_config_changed"; config: RemoteHostConfig };
   }): void;
 }) {
-  const negotiated = browserSettings ? { browserSettings } : {};
+  const negotiated = { browserSettings, speechSettings };
   function publishConfig(config: RemoteHostConfig): void {
     onConfigChanged?.({ type: "status", payload: { status: "daemon_config_changed", config } });
   }
@@ -40,7 +42,8 @@ export function createCentralHostSettings({
         }));
       case "set_daemon_config_request": {
         const patch = RemoteHostConfigPatchSchema.safeParse(request.config);
-        if (!patch.success || (patch.data.browserTools && !browserSettings)) {
+        if (!patch.success || (patch.data.browserTools && !browserSettings) ||
+          (patch.data.features && !speechSettings)) {
           return Promise.reject(new WorkerOperationError("worker_host_settings_patch_unsupported"));
         }
         return call({ kind: "hostSettingsPatch", config: patch.data, ...negotiated }).then((result) => {

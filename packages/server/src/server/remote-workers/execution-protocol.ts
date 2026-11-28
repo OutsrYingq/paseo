@@ -59,6 +59,7 @@ import {
 import { RemoteVoiceEvents, RemoteVoiceOperations, remoteVoiceResults } from "./remote-voice-protocol.js";
 import { RemoteBrowserEvents, RemoteBrowserOperations, remoteBrowserResults } from "./remote-browser-protocol.js";
 import { RemotePushOperationSchema, remotePushResults } from "./remote-push.js";
+import { SpeechModelsOperationSchema, speechModelsResult } from "./remote-speech-models.js";
 
 export const PUSH_HEADER = "x-paseo-push";
 export const PUSH_VERSION = "1";
@@ -119,6 +120,7 @@ export const WorkerOperationSchema = z.discriminatedUnion("kind", [
   ...RemoteVoiceOperations,
   ...RemoteBrowserOperations,
   ...RemotePushOperationSchema.options,
+  SpeechModelsOperationSchema,
   z.strictObject({
     kind: z.literal("explore"),
     ...fileTarget,
@@ -284,6 +286,7 @@ export const operationResults = {
   ...remoteBrowserResults,
   ...remotePushResults,
   ...remoteTerminalOperationResults,
+  speechModels: speechModelsResult,
   plugin: RemotePluginResultSchema,
   restartRuntime: z.null(),
   providerHome: z.string().min(1),

@@ -11,6 +11,7 @@ import {
   type RemoteHostSettingsOperation,
 } from "./remote-host-settings-protocol.js";
 import { WorkerOperationError } from "./execution-protocol.js";
+import type { SpeechSettingsOwner } from "../speech/speech-settings.js";
 
 const operatorControlledPaths = [
   "daemon.listen",
@@ -37,6 +38,7 @@ export function createResidentHostSettings(options: {
   daemonVersion?: string;
   listNativeProviders(): Promise<readonly string[]>;
   getStartedAt?(): string | null;
+  speech?: SpeechSettingsOwner;
 }) {
   const { paseoHome, logger } = options;
   const persisted = loadPersistedConfig(paseoHome, logger);
@@ -67,6 +69,7 @@ export function createResidentHostSettings(options: {
     {
       startupPersisted: persisted,
       relayEnabledMutable: false,
+      speech: options.speech,
       reloadSource: {
         resolve(next) {
           return {
@@ -87,10 +90,9 @@ export function createResidentHostSettings(options: {
     },
   );
 
-  function readConfig(includeBrowser: boolean | undefined) {
-    const { agentProfiles, terminalProfiles, pluginsEnabled, usage, metadataGeneration } = toWireDaemonConfig(
-      configStore.get(),
-    );
+  function readConfig(view: { browserSettings?: true; speechSettings?: true }) {
+    const { agentProfiles, terminalProfiles, pluginsEnabled, usage, metadataGeneration, features } =
+      toWireDaemonConfig(configStore.get());
     return RemoteHostConfigSchema.parse({
       ...initial,
       agentProfiles: agentProfiles ?? [],
@@ -98,7 +100,8 @@ export function createResidentHostSettings(options: {
       pluginsEnabled,
       usage,
       metadataGeneration,
-      browserTools: { enabled: includeBrowser === true && configStore.get().browserTools.enabled === true },
+      browserTools: { enabled: view.browserSettings === true && configStore.get().browserTools.enabled === true },
+      features: view.speechSettings ? features : undefined,
     });
   }
 
@@ -125,11 +128,18 @@ export function createResidentHostSettings(options: {
     async execute(operation: RemoteHostSettingsOperation) {
       switch (operation.kind) {
         case "hostSettingsGet":
-          return readConfig(operation.browserSettings);
+          return readConfig(operation);
         case "hostSettingsPatch": {
           const patch = RemoteHostConfigPatchSchema.safeParse(operation.config);
-          if (!patch.success || (patch.data.browserTools && !operation.browserSettings))
+          if (!patch.success || (patch.data.browserTools && !operation.browserSettings) ||
+            (patch.data.features && (!operation.speechSettings || !options.speech)))
             throw new WorkerOperationError("worker_host_settings_patch_unsupported");
+          const speech = patch.data.features;
+          for (const site of [speech?.dictation?.stt, speech?.voiceMode?.stt, speech?.voiceMode?.tts]) {
+            if (site && Object.hasOwn(site, "apiKey")) {
+              throw new WorkerOperationError("worker_speech_credentials_managed_by_operator");
+            }
+          }
           if (Object.keys(patch.data).length) {
             await configStore.patch((current) => ({
               ...patch.data,
@@ -147,10 +157,10 @@ export function createResidentHostSettings(options: {
               }),
             }));
           }
-          return readConfig(operation.browserSettings);
+          return readConfig(operation);
         }
         case "hostSettingsReload":
-          return { ...(await configStore.reload()), config: readConfig(operation.browserSettings) };
+          return { ...(await configStore.reload()), config: readConfig(operation) };
         case "hostStatus":
           return readStatus(operation.includeProviders !== false);
         case "hostDiagnostics": {
