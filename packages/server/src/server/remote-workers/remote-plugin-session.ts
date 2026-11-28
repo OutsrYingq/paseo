@@ -4,7 +4,7 @@ import {
   encodePluginOutputFrame,
 } from "@getpaseo/protocol/binary-frames/index";
 import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/protocol/messages";
-import type { RemotePluginClient } from "./remote-plugins-client.js";
+import { RemotePluginHandlerError, type RemotePluginClient } from "./remote-plugins-client.js";
 import type { RemotePluginRef } from "./remote-plugins-protocol.js";
 
 export function createRemotePluginSession(options: {
@@ -132,6 +132,52 @@ export function createRemotePluginSession(options: {
           });
           break;
         }
+        case "plugin.source.install.request": {
+          const entry = await client.request({
+            action: "installSource",
+            source: message.source,
+            id: message.id,
+            ref: message.ref,
+            pluginPath: message.pluginPath,
+          });
+          refs.set(entry.plugin.id, entry.plugin);
+          send({ type: "plugin.source.install.response", payload: { requestId, plugin: entry.item } });
+          break;
+        }
+        case "plugin.source.status.request": {
+          const plugins = await client.request({ action: "statusSources", pluginId: message.pluginId });
+          send({ type: "plugin.source.status.response", payload: { requestId, plugins } });
+          break;
+        }
+        case "plugin.source.update.request": {
+          const plugins = await client.request({ action: "updateSources", pluginId: message.pluginId });
+          send({ type: "plugin.source.update.response", payload: { requestId, plugins } });
+          break;
+        }
+        case "plugin.source.update.preview.request": {
+          const plugins = await client.request({
+            action: "previewUpdates",
+            pluginId: message.pluginId,
+            target: message.target,
+          });
+          send({ type: "plugin.source.update.preview.response", payload: { requestId, plugins } });
+          break;
+        }
+        case "plugin.source.update.apply.request": {
+          const plugins = await client.request({ action: "applyUpdates", proposals: message.proposals });
+          send({ type: "plugin.source.update.apply.response", payload: { requestId, plugins } });
+          break;
+        }
+        case "plugin.registry.list.request": {
+          const index = await client.request({ action: "listRegistry" });
+          send({ type: "plugin.registry.list.response", payload: { requestId, index } });
+          break;
+        }
+        case "plugin.registry.get.request": {
+          const plugin = await client.request({ action: "getRegistryPlugin", id: message.id });
+          send({ type: "plugin.registry.get.response", payload: { requestId, plugin } });
+          break;
+        }
         case "plugin.rpc.invoke.request": {
           const output = await client.invokePluginRpc(
             await plugin(message.pluginId),
@@ -191,10 +237,16 @@ export function createRemotePluginSession(options: {
         default:
           return false;
       }
-    } catch {
+    } catch (error) {
       send({
         type: "rpc_error",
-        payload: { requestId, requestType: message.type, error: "worker_plugin_operation_failed" },
+        payload: {
+          requestId,
+          requestType: message.type,
+          ...(error instanceof RemotePluginHandlerError
+            ? { error: `Request failed: ${error.message}`, code: "handler_error" }
+            : { error: "worker_plugin_operation_failed" }),
+        },
       });
     }
     return true;

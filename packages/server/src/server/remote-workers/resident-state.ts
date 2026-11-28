@@ -16,8 +16,8 @@ export async function openResidentState(paseoHome: string) {
     if (
       (!directories.has(parts[0] ?? "") &&
         !(
-          (operation.kind === "readState" && operation.path === "projects/projects.json") ||
-          ((operation.kind === "readState" || operation.kind === "writeState") &&
+          (operation.kind === "readState" || operation.kind === "writeState") &&
+          (operation.path === "projects/projects.json" ||
             operation.path === "projects/workspaces.json")
         )) ||
       parts.length > 3 ||

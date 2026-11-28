@@ -1,41 +1,74 @@
 ﻿import { constants } from "node:fs";
-import { open, realpath, type FileHandle } from "node:fs/promises";
+import { open, type FileHandle } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import path from "node:path";
 import {
   getDownloadableFileInfo,
   listDirectoryEntries,
   readExplorerFile,
 } from "../file-explorer/service.js";
-import { WorkerOperationError, type WorkerOperation } from "./execution-protocol.js";
+import { WorkerOperationError, type WorkerOperation, type WorkerEvent } from "./execution-protocol.js";
+import { mutateWorkspaceFile } from "../session/files/workspace-file-mutations.js";
+import { resolveResidentWorkspacePath } from "./resident-projects.js";
+import { workspaceFileObserver } from "../file-explorer/observer.js";
 
 type FileOperation = Extract<
   WorkerOperation,
   {
-    kind: "explore" | "downloadInfo" | "downloadOpen" | "downloadRead" | "downloadClose";
+    kind:
+      | "explore"
+      | "mutateWorkspaceFile"
+      | "observeWorkspaceFile"
+      | "unobserveWorkspaceFile"
+      | "downloadInfo"
+      | "downloadOpen"
+      | "downloadRead"
+      | "downloadClose";
   }
 >;
 export const DOWNLOAD_CHUNK_BYTES = 256 * 1024;
 
-export function openResidentFiles(roots: readonly string[]) {
+export function openResidentFiles(
+  roots: readonly string[],
+  publish: (event: Extract<WorkerEvent, { type: "fileVersion" }>) => void,
+) {
   const handles = new Map<string, FileHandle>();
+  const observations = new Map<string, () => void>();
   let closed = false;
-  async function scopedRoot(cwd: string): Promise<string> {
-    const candidate = await realpath(cwd);
-    for (const root of roots) {
-      const relative = path.relative(await realpath(root), candidate);
-      if (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`))
-        return candidate;
-    }
-    throw new WorkerOperationError("worker_workspace_root_denied");
-  }
+  const scopedRoot = (cwd: string) => resolveResidentWorkspacePath(roots, cwd);
   return {
     async execute(operation: FileOperation) {
       if (closed) throw new WorkerOperationError("worker_connection_lost");
       switch (operation.kind) {
+        case "observeWorkspaceFile": {
+          const { id, cwd, path } = operation;
+          if (observations.has(id)) throw new WorkerOperationError("invalid_request");
+          const observation = await workspaceFileObserver.subscribe(
+            { cwd: await scopedRoot(cwd), path },
+            (version) => publish({ type: "fileVersion", id, version }),
+          );
+          if (closed || observations.has(id)) {
+            observation.unsubscribe();
+            throw new WorkerOperationError("worker_file_observation_unavailable");
+          }
+          observations.set(id, observation.unsubscribe);
+          return observation.initial;
+        }
+        case "unobserveWorkspaceFile":
+          observations.get(operation.id)?.();
+          observations.delete(operation.id);
+          return null;
+        case "mutateWorkspaceFile":
+          return mutateWorkspaceFile(operation.request, await scopedRoot(operation.request.cwd));
         case "explore": {
           const root = await scopedRoot(operation.cwd);
           const relativePath = operation.path;
+          if (
+            operation.mode === "file" &&
+            operation.maxBytes !== undefined &&
+            (await getDownloadableFileInfo({ root, relativePath })).size > operation.maxBytes
+          ) {
+            throw new WorkerOperationError("File is too large to display");
+          }
           return operation.mode === "list"
             ? {
                 directory: await listDirectoryEntries({ root, relativePath }),
@@ -94,6 +127,8 @@ export function openResidentFiles(roots: readonly string[]) {
     },
     async close() {
       closed = true;
+      for (const stop of observations.values()) stop();
+      observations.clear();
       await Promise.allSettled([...handles.values()].map((handle) => handle.close()));
       handles.clear();
     },

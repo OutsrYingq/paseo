@@ -2,7 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { PassThrough, Writable } from "node:stream";
 import { CodexAppServerAgentClient } from "../agent/providers/codex-app-server-agent.js";
-import { OmpAgentClient } from "../agent/providers/omp/agent.js";
+import { RemoteOmpAgentClient } from "./remote-omp-agent-client.js";
 import { OmpCliRuntime } from "../agent/providers/omp/cli-runtime.js";
 import type { AgentClient } from "../agent/agent-sdk-types.js";
 import type { Logger } from "pino";
@@ -91,12 +91,15 @@ export class RemoteProviderProcesses {
             systemPrompt,
           }),
       });
-      clients.omp = new OmpAgentClient({
+      clients.omp = new RemoteOmpAgentClient({
         logger,
         runtime,
         executionIsRemote: true,
         resolveCatalogHome: () => this.connection.call({ kind: "providerHome" }),
         readHistory: (file, branch) => this.readOmpHistory(file, branch),
+      }, {
+        ompImportList: (operation) => this.connection.call(operation),
+        ompImportResolve: (operation) => this.connection.call(operation),
       });
     }
     return clients;

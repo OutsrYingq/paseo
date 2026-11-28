@@ -9,6 +9,9 @@ import {
   EXECUTION_MAX_FRAME,
   EXECUTION_PROTOCOL,
   RUNTIME_RESTART_FEATURE,
+  WORKSPACE_OPERATIONS_HEADER,
+  WORKSPACE_OPERATIONS_VERSION,
+  WORKSPACE_OPERATION_KINDS,
   ExecutionResponseSchema,
   WorkerOperationError,
   decodeJson,
@@ -17,6 +20,19 @@ import {
   type WorkerOperation,
   type WorkerResult,
 } from "./execution-protocol.js";
+import type { RemotePluginAction } from "./remote-plugins-protocol.js";
+
+const pluginSourceActions: ReadonlySet<RemotePluginAction["action"]> = new Set([
+  "listRegistry",
+  "getRegistryPlugin",
+  "installSource",
+  "statusSources",
+  "updateSources",
+  "previewUpdates",
+  "applyUpdates",
+  "usageReports",
+  "usageLegacy",
+]);
 
 export type WorkerTlsClientOptions = Pick<
   ConnectionOptions,
@@ -33,6 +49,11 @@ export class WorkerConnection {
   private readonly lifetime = new AbortController();
   readonly signal = this.lifetime.signal;
   private runtimeRestart = false;
+  private workspaceOperations = false;
+
+  get supportsWorkspaceOperations() {
+    return this.workspaceOperations;
+  }
 
   get supportsRuntimeRestart() {
     return this.runtimeRestart;
@@ -62,7 +83,10 @@ export class WorkerConnection {
     });
     this.socket = new WebSocket(endpoint, EXECUTION_PROTOCOL, {
       agent,
-      headers: { [EXECUTION_FEATURES_HEADER]: RUNTIME_RESTART_FEATURE },
+      headers: {
+        [EXECUTION_FEATURES_HEADER]: RUNTIME_RESTART_FEATURE,
+        [WORKSPACE_OPERATIONS_HEADER]: WORKSPACE_OPERATIONS_VERSION,
+      },
       followRedirects: false,
       handshakeTimeout: 5_000,
       maxPayload: EXECUTION_MAX_FRAME,
@@ -95,6 +119,7 @@ export class WorkerConnection {
           if (message.kind !== "bound" || !sameWorkerBinding(binding, message.binding))
             return this.close();
           this.runtimeRestart = message.restartRuntime === true;
+          this.workspaceOperations = message.workspaceOperations === true;
           bound = true;
           clearTimeout(timer);
           resolve();
@@ -129,6 +154,17 @@ export class WorkerConnection {
     operation: WorkerOperation & { kind: K },
   ): Promise<WorkerResult<K>> {
     await this.ready();
+    const request: WorkerOperation = operation;
+    if (WORKSPACE_OPERATION_KINDS.has(operation.kind) && !this.workspaceOperations) {
+      throw new WorkerOperationError("worker_workspace_operations_unsupported");
+    }
+    if (
+      request.kind === "plugin" &&
+      pluginSourceActions.has(request.request.action) &&
+      !this.workspaceOperations
+    ) {
+      throw new WorkerOperationError("worker_plugin_sources_unsupported");
+    }
     if (this.pending.size >= EXECUTION_MAX_CALLS) throw new WorkerOperationError("worker_busy");
     const id = randomUUID();
     const frame = JSON.stringify({ kind: "call", id, operation });

@@ -17,6 +17,8 @@ import {
   EXECUTION_PATH,
   EXECUTION_PROTOCOL,
   RUNTIME_RESTART_FEATURE,
+  WORKSPACE_OPERATIONS_HEADER,
+  WORKSPACE_OPERATIONS_VERSION,
   ExecutionRequestSchema,
   WorkerOperationError,
   decodeJson,
@@ -29,6 +31,7 @@ import { WorkerBindingSchema, sameWorkerBinding, type WorkerBinding } from "./le
 export interface ResidentRuntime {
   execute(operation: Exclude<WorkerOperation, { kind: "restartRuntime" }>): Promise<unknown>;
   restartRuntime?(keepTerminals: boolean): Promise<void>;
+  workspaceOperations?: true;
   close(): Promise<void>;
 }
 
@@ -100,6 +103,7 @@ export async function startResidentExecution(options: ResidentExecutionOptions) 
         ownBinding,
         options,
         request.headers[EXECUTION_FEATURES_HEADER] === RUNTIME_RESTART_FEATURE,
+        request.headers[WORKSPACE_OPERATIONS_HEADER] === WORKSPACE_OPERATIONS_VERSION,
       )
         .catch((error: unknown) => {
           // Stay fenced until the host stops this resident, even if no client is connected.
@@ -159,6 +163,7 @@ async function handleChannel(
   binding: WorkerBinding,
   options: ResidentExecutionOptions,
   negotiateRestart: boolean,
+  negotiateWorkspaceOperations: boolean,
 ): Promise<void> {
   const lifetime = new AbortController();
   const inflight = new Map<string, Promise<void>>();
@@ -216,6 +221,9 @@ async function handleChannel(
             kind: "bound",
             binding,
             ...(negotiateRestart && opened.restartRuntime ? { restartRuntime: true } : {}),
+            ...(negotiateWorkspaceOperations && opened.workspaceOperations
+              ? { workspaceOperations: true }
+              : {}),
           });
         },
         () => socket.terminate(),

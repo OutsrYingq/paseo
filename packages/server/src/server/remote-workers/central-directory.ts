@@ -16,10 +16,18 @@ import { DirectorySyncService } from "../directory-sync/index.js";
 import { matchesAgentHistoryQuery } from "../agent-history-search.js";
 import { WorkspaceDirectory } from "../workspace-directory.js";
 import { describeProject } from "../project-descriptor.js";
+import { registerProjectDirectory } from "../project-registration.js";
+import { createProjectDirectory, ProjectDirectoryRequestError } from "../project-directory-service.js";
+import { generateWorkspaceId, initialWorkspacePlacement } from "../workspace-registry-model.js";
+import { areEquivalentPaths } from "../../utils/path.js";
+import { createImportWorkspacePlacement } from "../session/agent-history/import-workspace-placement.js";
+import pLimit from "p-limit";
+import { getErrorMessage } from "@getpaseo/protocol/error-utils";
 import { matchesAgentUpdatesFilter } from "../session/agent-updates/agent-updates-service.js";
 import {
   PersistedProjectRecordSchema,
   PersistedWorkspaceRecordSchema,
+  FileBackedProjectRegistry,
   FileBackedWorkspaceRegistry,
   createPersistedWorkspaceRecord,
   resolveProjectDisplayName,
@@ -27,7 +35,9 @@ import {
 } from "../workspace-registry.js";
 import type { openCentralAgents } from "./central-agents.js";
 import type { createRemoteState } from "./remote-state.js";
+import type { createRemoteScripts } from "./remote-scripts.js";
 import { WorkerOperationError } from "./execution-protocol.js";
+import { createCentralProjectManagement } from "./central-project-management.js";
 
 type Request = Extract<
   SessionInboundMessage,
@@ -45,19 +55,136 @@ export function createCentralDirectory(
   state: ReturnType<typeof createRemoteState>,
   agents: Awaited<ReturnType<typeof openCentralAgents>>,
   connection: WorkerConnection,
+  scripts: Pick<ReturnType<typeof createRemoteScripts>, "list">,
 ) {
   const sync = new DirectorySyncService();
   const agentPager = createAgentDirectoryPager();
-  const projects = z.array(PersistedProjectRecordSchema);
   const workspaceRegistry = new FileBackedWorkspaceRegistry("projects/workspaces.json", logger, {
     readRecords: state.read,
     writeRecords: (file, records) => state.write(file, JSON.stringify(records)),
   });
-  const projectRegistry = {
-    list: async () =>
-      projects.parse(JSON.parse((await state.read("projects/projects.json")) ?? "[]")),
-  };
+  const projectRegistry = new FileBackedProjectRegistry("projects/projects.json", logger, {
+    readRecords: state.read,
+    writeRecords: (file, records) => state.write(file, JSON.stringify(records)),
+  });
+  const archiveListeners = new Set<() => void>();
+  const archive = agents.createArchiveSession({
+    call: (operation) => connection.call(operation),
+    workspaceRegistry,
+    projectRegistry,
+    async emitWorkspaceUpdatesForWorkspaceIds() {
+      for (const notify of archiveListeners) notify();
+    },
+  });
+  const projectManagement = createCentralProjectManagement({
+    projectRegistry,
+    workspaceRegistry,
+    archiveWorkspaceForProjectRemoval: (workspaceId, requestId) =>
+      archive.archive({ kind: "workspace", workspaceId }, requestId, { retainCheckout: true }),
+    restoreWorkspaceForOpen: archive.restore,
+    projectConfig: {
+      read: (request) => connection.call({ kind: "projectConfigRead", request }),
+      write: (request) => connection.call({ kind: "projectConfigWrite", request }),
+      resolveRoot: (path) => connection.call({ kind: "projectDirectoryParent", parentPath: path }),
+    },
+    projectIcons: {
+      get: (project) => connection.call({ kind: "projectIconGet", projectId: project.projectId }),
+      async set(project, source) {
+        const projectId = project.projectId;
+        const customIconRevision = await connection.call({ kind: "projectIconSet", projectId, source });
+        const updatedAt = new Date().toISOString();
+        if (!(await projectRegistry.update(projectId, (current) => ({ ...current, customIconRevision, updatedAt }))))
+          throw new Error("Project not found");
+      },
+      async remove(project) {
+        await connection.call({ kind: "projectIconRemove", projectId: project.projectId });
+      },
+    },
+    logger,
+  });
+  function dispatchProject(message: SessionInboundMessage): Promise<SessionOutboundMessage> | undefined {
+    if (message.type === "workspace.github.search_repositories.request")
+      return connection.call({ kind: "projectGithubSearch", request: message });
+    if (message.type === "project.github.clone.request") return cloneGithubProject(message);
+    return projectManagement.dispatch(message);
+  }
+
+  async function cloneGithubProject(
+    request: Extract<SessionInboundMessage, { type: "project.github.clone.request" }>,
+  ): Promise<SessionOutboundMessage> {
+    const { requestId } = request;
+    let repo = request.repo;
+    let checkoutPath: string | null = null;
+    try {
+      const cloned = await connection.call({ kind: "projectGithubClone", request });
+      ({ repo, checkoutPath } = cloned);
+      const project = await registerProjectDirectory(projectRegistry, cloned.registration);
+      return {
+        type: "project.github.clone.response",
+        payload: { requestId, repo, checkoutPath, project: describeProject(project), error: null },
+      };
+    } catch (error) {
+      return {
+        type: "project.github.clone.response",
+        payload: { requestId, repo, checkoutPath, project: null, error: getErrorMessage(error) },
+      };
+    }
+  }
+
+  function dispatchWorkspaceArchive(message: SessionInboundMessage) {
+    if (
+      message.type !== "workspace.recovery.restore.request" &&
+      message.type !== "workspace.archive.undo.request"
+    ) {
+      return archive.dispatch(message);
+    }
+    return workspaceRegistry.get(message.workspaceId).then((workspace) =>
+      workspace
+        ? projectManagement.withProjectMutation(workspace.projectId, () => archive.dispatch(message)!)
+        : archive.dispatch(message)!,
+    );
+  }
+  async function approveWorkspaceSetup(workspaceId: string): Promise<boolean> {
+    const workspace = await workspaceRegistry.get(workspaceId);
+    if (!workspace || workspace.archivedAt) throw new Error(`Workspace not found: ${workspaceId}`);
+    const checkout = workspace.worktreeRoot ?? workspace.cwd;
+    return archive.operations.withCheckout(checkout, async () => {
+      const current = await workspaceRegistry.get(workspaceId);
+      if (!current || current.archivedAt ||
+        !areEquivalentPaths(checkout, current.worktreeRoot ?? current.cwd)) {
+        throw new Error("Workspace checkout changed");
+      }
+      const { clearedMetadata, blockedWorkspaceIds } = await connection.call({
+        kind: "worktreeApproveSetup",
+        workspaceId,
+      });
+      if (!clearedMetadata && blockedWorkspaceIds.length === 0) return false;
+      const updatedAt = new Date().toISOString();
+      for (const id of blockedWorkspaceIds) {
+        await workspaceRegistry.update(id, (record) => {
+          if (!record.untrustedSource) return record;
+          const { untrustedSource: _untrusted, ...trusted } = record;
+          return { ...trusted, updatedAt };
+        });
+      }
+      await connection.call({ kind: "worktreeStartSetup", workspaceId });
+      return true;
+    });
+  }
   const listWorkspaces = () => workspaceRegistry.listAll();
+  async function updateCheckoutBranch(cwd: string, branch: string | null) {
+    for (const workspace of await listWorkspaces()) {
+      if (workspace.archivedAt || workspace.branch === branch || !areEquivalentPaths(workspace.cwd, cwd)) {
+        continue;
+      }
+      await workspaceRegistry.update(workspace.workspaceId, (record) => ({
+        ...record,
+        branch,
+        updatedAt: new Date().toISOString(),
+      }));
+    }
+  }
+  const openProjectLane = pLimit(1);
   function placement(
     workspace: z.infer<typeof PersistedWorkspaceRecordSchema>,
     project: z.infer<typeof PersistedProjectRecordSchema>,
@@ -95,13 +222,18 @@ export function createCentralDirectory(
       metadata: workspace.metadata,
       background: workspace.background,
       parentWorkspaceId: workspace.parentWorkspaceId,
-      archivingAt: null,
+      archivingAt: archive.operations.getArchivingAt(workspace.workspaceId),
       status: "done",
       statusEnteredAt: null,
       activityAt: null,
       createdAt: workspace.createdAt,
       diffStat: null,
-      scripts: [],
+      scripts: connection.supportsWorkspaceOperations && !workspace.archivedAt
+        ? await scripts.list(workspace.workspaceId).catch((error: unknown) => {
+            logger.debug({ err: error, workspaceId: workspace.workspaceId }, "Script snapshot unavailable");
+            return [];
+          })
+        : [],
       ...(projectRecord ? { project: placement(workspace, projectRecord) } : {}),
     };
   }
@@ -264,44 +396,239 @@ export function createCentralDirectory(
       workspace && projectRecords.find((entry) => entry.projectId === workspace.projectId);
     return workspace && project ? placement(workspace, project) : null;
   }
+  async function addProject(
+    request: Extract<SessionInboundMessage, { type: "project.add.request" }>,
+  ): Promise<Extract<SessionOutboundMessage, { type: "project.add.response" }>> {
+    const { cwd, requestId } = request;
+    try {
+      const registration = await connection.call({ kind: "inspectProject", cwd });
+      if (!registration) {
+        return {
+          type: "project.add.response",
+          payload: {
+            requestId,
+            project: null,
+            error: `Directory not found: ${cwd}`,
+            errorCode: "directory_not_found",
+          },
+        };
+      }
+      const project = await registerProjectDirectory(projectRegistry, registration);
+      return {
+        type: "project.add.response",
+        payload: { requestId, project: describeProject(project), error: null },
+      };
+    } catch (error) {
+      return {
+        type: "project.add.response",
+        payload: { requestId, project: null, error: getErrorMessage(error) },
+      };
+    }
+  }
+  async function createDirectory(
+    request: Extract<SessionInboundMessage, { type: "project.create_directory.request" }>,
+  ): Promise<Extract<SessionOutboundMessage, { type: "project.create_directory.response" }>> {
+    const { requestId, name } = request;
+    let parentPath = request.parentPath;
+    async function change(action: "create" | "rollback") {
+      try {
+        await connection.call({ kind: "projectDirectoryChange", parentPath, name, action });
+      } catch (error) {
+        if (error instanceof WorkerOperationError) {
+          throw Object.assign(error, { code: error.message });
+        }
+        throw error;
+      }
+    }
+    try {
+      const result = await createProjectDirectory(request, {
+        async resolveParent(requestedPath) {
+          try {
+            parentPath = await connection.call({ kind: "projectDirectoryParent", parentPath: requestedPath });
+            return parentPath;
+          } catch (error) {
+            const code = getErrorMessage(error);
+            if (code === "ENOENT" || code === "ENOTDIR") {
+              throw new ProjectDirectoryRequestError(
+                "parent_directory_not_found", `Parent directory not found: ${requestedPath}`,
+              );
+            }
+            if (code === "worker_workspace_root_denied" || code === "EACCES" || code === "EPERM") {
+              throw new ProjectDirectoryRequestError(
+                "permission_denied", `Permission denied reading parent directory: ${requestedPath}`,
+              );
+            }
+            throw new ProjectDirectoryRequestError("filesystem_error", code);
+          }
+        },
+        filesystem: {
+          mkdir: () => change("create"),
+          rmdir: () => change("rollback"),
+        },
+        async registerProject(cwd) {
+          const registration = await connection.call({ kind: "inspectProject", cwd });
+          if (!registration) throw new WorkerOperationError("directory_not_found");
+          return registerProjectDirectory(projectRegistry, registration);
+        },
+      });
+      return {
+        type: "project.create_directory.response",
+        payload: {
+          requestId,
+          directoryPath: result.directoryPath,
+          project: describeProject(result.project),
+          error: null,
+          errorCode: null,
+        },
+      };
+    } catch (error) {
+      return {
+        type: "project.create_directory.response",
+        payload: {
+          requestId,
+          directoryPath: error instanceof ProjectDirectoryRequestError ? error.directoryPath : null,
+          project: null,
+          error: getErrorMessage(error),
+          errorCode: error instanceof ProjectDirectoryRequestError ? error.code : "registration_failed",
+        },
+      };
+    }
+  }
+
+  async function findOrCreateWorkspaceForDirectory(cwd: string) {
+    const registration = await connection.call({ kind: "inspectProject", cwd });
+    if (!registration) {
+      throw Object.assign(new Error(`Directory not found: ${cwd}`), { code: "directory_not_found" });
+    }
+    return openProjectLane(async () => {
+      const canonical = await connection.call({ kind: "projectDirectoryParent", parentPath: cwd });
+      const candidate = await projectManagement.resolveOpenWorkspace(canonical);
+      if (candidate) return candidate;
+      const project = await registerProjectDirectory(projectRegistry, registration);
+      const workspaceId = generateWorkspaceId();
+      const prepared = await prepareWorkspace({
+        type: "workspace.create.request",
+        requestId: workspaceId,
+        source: { kind: "directory", path: registration.rootPath, projectId: project.projectId },
+      });
+      return (await prepared.provision(workspaceId)).record;
+    });
+  }
+
+  const runInImportWorkspace = createImportWorkspacePlacement({
+    workspaceRegistry,
+    projectRegistry,
+    findOrCreateWorkspaceForDirectory,
+    async matchesCwd(workspaceCwd, importCwd) {
+      const target = await connection.call({ kind: "workspacePath", cwd: importCwd, parent: workspaceCwd });
+      return target !== null && areEquivalentPaths(target, workspaceCwd);
+    },
+    logger,
+  });
+
+  async function openProject(
+    request: Extract<SessionInboundMessage, { type: "open_project_request" }>,
+  ): Promise<Extract<SessionOutboundMessage, { type: "open_project_response" }>> {
+    const { requestId, cwd } = request;
+    try {
+      const record = await findOrCreateWorkspaceForDirectory(cwd);
+      const workspace = await describeWorkspace({
+        workspace: record,
+        projectRecord: await projectRegistry.get(record.projectId),
+      });
+      return { type: "open_project_response", payload: { requestId, workspace, error: null } };
+    } catch (error) {
+      return {
+        type: "open_project_response",
+        payload: {
+          requestId,
+          workspace: null,
+          error: getErrorMessage(error),
+          errorCode: error instanceof Error && "code" in error && error.code === "directory_not_found"
+            ? "directory_not_found"
+            : null,
+        },
+      };
+    }
+  }
+
   async function prepareWorkspace(request: WorkspaceCreateRequest) {
-    if (request.source.kind !== "directory" || request.internal || request.callerAgentId) {
+    if (request.internal || request.callerAgentId) {
       throw new WorkerOperationError("worker_workspace_source_unsupported");
     }
     const source = request.source;
+    const sourcePath = source.kind === "directory" ? source.path : source.cwd;
     const project = (await projectRegistry.list()).find(
       (record) =>
         !record.archivedAt &&
         (source.projectId
           ? record.projectId === source.projectId
-          : record.rootPath === source.path),
+          : record.rootPath === sourcePath),
     );
     if (!project) throw new WorkerOperationError("worker_workspace_project_required");
+    if (source.kind === "worktree" && project.kind !== "git") {
+      throw new WorkerOperationError("worker_checkout_not_git");
+    }
     const cwd = await connection.call({
       kind: "workspacePath",
-      cwd: source.path,
+      cwd: sourcePath ?? project.rootPath,
       parent: project.rootPath,
     });
     if (!cwd) throw new WorkerOperationError("directory_not_found");
+    const inWorktree = source.kind === "worktree";
     const agentCwd =
-      request.agent &&
+      !inWorktree && request.agent &&
       (await connection.call({
         kind: "workspacePath",
         cwd: request.agent.config.cwd,
         parent: cwd,
       }));
-    if (request.agent && !agentCwd)
+    if (!inWorktree && request.agent && !agentCwd)
       throw new WorkerOperationError("worker_agent_directory_outside_workspace");
     return {
-      agentCwd,
-      async provision(workspaceId: string) {
+      agentCwd: inWorktree || !agentCwd ? null : agentCwd,
+      provision(workspaceId: string) {
+        return projectManagement.withProjectMutation(project.projectId, async () => {
+          const currentProject = await projectRegistry.get(project.projectId);
+          if (!currentProject || currentProject.archivedAt ||
+            !areEquivalentPaths(currentProject.rootPath, project.rootPath)) {
+            throw new WorkerOperationError("worker_workspace_project_required");
+          }
+        const materialized = source.kind === "worktree"
+          ? await connection.call({
+              kind: "worktreeMaterialize",
+              cwd,
+              worktreeSlug: source.worktreeSlug,
+              branchName: source.branchName,
+              refName: source.refName ?? source.baseBranch,
+              action: source.action,
+              checkoutSource: source.checkoutSource,
+              githubPrNumber: source.githubPrNumber,
+            })
+          : null;
+        if (materialized && "error" in materialized) {
+          throw Object.assign(new Error(materialized.error.message), { code: materialized.error.code });
+        }
+        const placement = materialized
+          ? initialWorkspacePlacement({
+              source: "created_worktree",
+              cwd: materialized.cwd,
+              worktreeRoot: materialized.worktreeRoot,
+              branch: materialized.branch,
+              baseBranch: materialized.baseBranch,
+              mainRepoRoot: materialized.repoRoot,
+            })
+          : {
+              cwd,
+              kind: project.kind === "git" ? "local_checkout" as const : "directory" as const,
+              displayName: cwd.replaceAll("\\", "/").split("/").findLast(Boolean) ?? cwd,
+            };
         const now = new Date().toISOString();
         const workspace = createPersistedWorkspaceRecord({
           workspaceId,
           projectId: project.projectId,
-          cwd,
-          kind: project.kind === "git" ? "local_checkout" : "directory",
-          displayName: cwd.replaceAll("\\", "/").split("/").findLast(Boolean) ?? cwd,
+          ...placement,
+          untrustedSource: materialized?.untrustedSource,
           title:
             request.title?.trim() ||
             resolveFirstAgentPromptTitle(
@@ -315,11 +642,35 @@ export function createCentralDirectory(
           updatedAt: now,
         });
         await workspaceRegistry.upsert(workspace);
-        return { workspace: await describeWorkspace({ workspace, projectRecord: project }) };
+        if (materialized) {
+          await connection.call({ kind: "worktreeStartSetup", workspaceId }).catch((error: unknown) => {
+            logger.error({ err: error, workspaceId }, "Could not start workspace setup");
+          });
+        }
+          return { workspace: await describeWorkspace({ workspace, projectRecord: currentProject }), record: workspace };
+        });
       },
     };
   }
-  return { read, projectForWorkspace, prepareWorkspace, workspaceRegistry };
+  return {
+    read,
+    addProject,
+    createDirectory,
+    openProject,
+    projectForWorkspace,
+    prepareWorkspace,
+    updateCheckoutBranch,
+    workspaceRegistry,
+    archive: dispatchWorkspaceArchive,
+    manageProject: dispatchProject,
+    projectRegistry,
+    approveWorkspaceSetup,
+    subscribeToArchiveChanges(listener: () => void) {
+      archiveListeners.add(listener);
+      return () => archiveListeners.delete(listener);
+    },
+    runInImportWorkspace,
+  };
 }
 
 type DirectoryResponse = Extract<
@@ -370,15 +721,24 @@ export function createDirectorySubscriptions(options: {
         return [];
       }
       let previous = new Map<string, ReturnType<typeof entries>[number][1]>();
-      const stop = manager.subscribe((event) => {
-        if (event.type !== "agent_state" && event.type !== "agent_removed") return;
+      function changed() {
         dirty = true;
         if (!reading) void refresh();
+      }
+      const stopWorkspace = directory.workspaceRegistry.subscribeToMutations(changed);
+      const stopProject = directory.projectRegistry.subscribeToMutations(changed);
+      const stopArchive = directory.subscribeToArchiveChanges(changed);
+      const stopAgent = manager.subscribe((event) => {
+        if (event.type === "agent_state" || event.type === "agent_removed") changed();
       });
-      subscriptions.set(subscriptionId, () => {
+      function stop() {
         stopped = true;
-        stop();
-      });
+        stopWorkspace();
+        stopProject();
+        stopArchive();
+        stopAgent();
+      }
+      subscriptions.set(subscriptionId, stop);
       function delta(value: ReturnType<typeof entries>[number][1]) {
         if ("agent" in value)
           send({ type: "agent_update", payload: { kind: "upsert", subscriptionId, ...value } });

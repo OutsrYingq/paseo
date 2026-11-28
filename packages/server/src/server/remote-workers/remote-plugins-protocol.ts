@@ -3,7 +3,19 @@ import {
   PluginIdSchema,
   PluginListItemSchema,
   PluginLogEntrySchema,
+  PluginRegistryGetRequestSchema,
+  PluginRegistryGetResponseSchema,
+  PluginRegistryListResponseSchema,
   PluginRequirementsSchema,
+  PluginSourceInstallRequestSchema,
+  PluginSourceStatusItemSchema,
+  PluginSourceUpdateItemSchema,
+  PluginUpdateApplyRequestSchema,
+  PluginUpdatePreviewRequestSchema,
+  PluginUpdatePreviewSchema,
+  PluginUpdateResultSchema,
+  ProviderUsageSchema,
+  UsageReportEntrySchema,
 } from "@getpaseo/protocol/messages";
 import {
   ProviderEventSchema,
@@ -27,12 +39,43 @@ const rpcPayload = z.discriminatedUnion("encoding", [
 const rpc = { plugin, method: name, input: rpcPayload };
 
 export const RemotePluginActionSchema = z.discriminatedUnion("action", [
+  z.strictObject({
+    action: z.literal("usageReports"),
+    queryId: id,
+    forceRefresh: z.boolean().optional(),
+    reportIds: z.array(name).optional(),
+    sessionId: name.optional(),
+  }),
+  z.strictObject({ action: z.literal("usageLegacy") }),
   z.strictObject({ action: z.literal("list") }),
   z.strictObject({ action: z.literal("inspectDirectory"), path: name }),
   z.strictObject({
     action: z.literal("installDirectory"),
     path: name,
     id: PluginIdSchema.optional(),
+  }),
+  z.strictObject({
+    action: z.literal("installSource"),
+    source: PluginSourceInstallRequestSchema.shape.source,
+    id: PluginSourceInstallRequestSchema.shape.id,
+    ref: PluginSourceInstallRequestSchema.shape.ref,
+    pluginPath: PluginSourceInstallRequestSchema.shape.pluginPath,
+  }),
+  z.strictObject({ action: z.literal("statusSources"), pluginId: PluginIdSchema.optional() }),
+  z.strictObject({ action: z.literal("updateSources"), pluginId: PluginIdSchema.optional() }),
+  z.strictObject({
+    action: z.literal("previewUpdates"),
+    pluginId: PluginUpdatePreviewRequestSchema.shape.pluginId,
+    target: PluginUpdatePreviewRequestSchema.shape.target,
+  }),
+  z.strictObject({
+    action: z.literal("applyUpdates"),
+    proposals: PluginUpdateApplyRequestSchema.shape.proposals,
+  }),
+  z.strictObject({ action: z.literal("listRegistry") }),
+  z.strictObject({
+    action: z.literal("getRegistryPlugin"),
+    id: PluginRegistryGetRequestSchema.shape.id,
   }),
   z.strictObject({ action: z.literal("logs"), plugin }),
   z.strictObject({
@@ -103,7 +146,16 @@ export const RemotePluginValueSchemas = {
   list: z.array(listItem),
   inspectDirectory: z.strictObject({ id: PluginIdSchema }),
   installDirectory: listItem,
+  installSource: listItem,
+  statusSources: z.array(PluginSourceStatusItemSchema),
+  updateSources: z.array(PluginSourceUpdateItemSchema),
+  previewUpdates: z.array(PluginUpdatePreviewSchema),
+  applyUpdates: z.array(PluginUpdateResultSchema),
+  listRegistry: PluginRegistryListResponseSchema.shape.payload.shape.index,
+  getRegistryPlugin: PluginRegistryGetResponseSchema.shape.payload.shape.plugin,
   logs: z.array(PluginLogEntrySchema.strict()),
+  usageReports: z.array(UsageReportEntrySchema),
+  usageLegacy: z.strictObject({ fetchedAt: z.string(), providers: z.array(ProviderUsageSchema) }),
   catalog: z.array(
     z.strictObject({
       plugin,
@@ -132,13 +184,18 @@ export const RemotePluginValueSchemas = {
   sessionClose: z.null(),
 } satisfies Record<RemotePluginAction["action"], z.ZodType>;
 
+const resultAction = z.enum(Object.keys(RemotePluginValueSchemas) as RemotePluginAction["action"][]);
+
 // Keep result validation keyed to the originating action, including at the Central boundary.
-export const RemotePluginResultSchema = z
-  .strictObject({
-    action: z.enum(Object.keys(RemotePluginValueSchemas) as RemotePluginAction["action"][]),
+export const RemotePluginResultSchema = z.union([
+  z.strictObject({
+    action: resultAction,
+    error: z.string(),
+  }),
+  z.strictObject({
+    action: resultAction,
     value: z.unknown(),
-  })
-  .superRefine(({ action, value }, context) => {
+  }).superRefine(({ action, value }, context) => {
     if (!RemotePluginValueSchemas[action].safeParse(value).success) {
       context.addIssue({
         code: "custom",
@@ -146,7 +203,8 @@ export const RemotePluginResultSchema = z
         message: "Invalid remote plugin result",
       });
     }
-  });
+  }),
+]);
 export type RemotePluginResult = z.infer<typeof RemotePluginResultSchema>;
 export type RemotePluginValue<K extends RemotePluginAction["action"]> = z.infer<
   (typeof RemotePluginValueSchemas)[K]
@@ -160,6 +218,7 @@ export const RemotePluginEventSchema = z.strictObject({
     z.strictObject({ type: z.literal("catalogChanged"), plugin }),
     z.strictObject({ type: z.literal("settingsChanged"), plugin, settingsId: name }),
     z.strictObject({ type: z.literal("providersChanged") }),
+    z.strictObject({ type: z.literal("usageReport"), queryId: id, report: UsageReportEntrySchema }),
     z.strictObject({ type: z.literal("subscriptionEvent"), subscriptionId: id, value: rpcPayload }),
     z.strictObject({
       type: z.literal("subscriptionClosed"),

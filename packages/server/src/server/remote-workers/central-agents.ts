@@ -11,10 +11,13 @@ import type { AgentCreateRequest, SendAgentMessageRequest } from "@getpaseo/prot
 import { AgentManager, type AgentManagerOptions } from "../agent/agent-manager.js";
 import { buildStoredAgentPayload } from "../agent/agent-projections.js";
 import {
-  sendPreparedPromptToAgent,
+  sendPromptToAgent,
   unarchiveAgentState,
   waitForAgentRunStartWithTimeout,
 } from "../agent/agent-prompt.js";
+import { createManagerMessageDelivery } from "../agent/agent-messages/manager-delivery.js";
+import type { AgentMessageBehavior } from "../agent/agent-messages/index.js";
+import { createCentralWorkspaceArchive } from "./central-workspace-archive.js";
 import type { AgentClient } from "../agent/agent-sdk-types.js";
 import { resolveCreateAgentTitles } from "../agent/create-agent-title.js";
 import {
@@ -39,8 +42,10 @@ import {
 } from "../persistence-hooks.js";
 import { WorkerOperationError } from "./execution-protocol.js";
 import type { createRemoteState } from "./remote-state.js";
+import type { createRemoteFileTransfer } from "./remote-file-transfer.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "../agent/agent-loading.js";
 import { AgentConfigSession } from "../session/agent-config/agent-config-session.js";
+import { createCentralHistory } from "./central-history.js";
 import { listAgentCommands } from "../session/agent-config/list-agent-commands.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 
@@ -49,7 +54,10 @@ export type CentralTimelineUpdate = Extract<
   { type: "agent_stream" | "agent.timeline.replacement" }
 >;
 
+type ResolveAttachments = ReturnType<typeof createRemoteFileTransfer>["resolveAttachments"];
+
 export interface CentralAgentOptions {
+  serverId: string;
   state: ReturnType<typeof createRemoteState>;
   logger: Logger;
   createClients(): Promise<Record<string, AgentClient>>;
@@ -79,6 +87,7 @@ export async function openCentralAgents(
     registry: storage,
   });
   const dependencies = { logger, agentManager: manager, agentStorage: storage };
+  const agentMessages = createManagerMessageDelivery({ ...dependencies, signal });
   const detachStorage = attachAgentStoragePersistence(logger, manager, storage);
   const receiptsDirectory = "agent-requests";
   const receipts = new MessageReceipts(receiptsDirectory, state.receipts);
@@ -156,16 +165,18 @@ export async function openCentralAgents(
       activeTurnBehavior?: SendAgentMessageRequest["activeTurnBehavior"];
       messageId?: string;
     },
-    request?: AbortSignal,
+    request: AbortSignal | undefined,
     beforeDispatch?: () => Promise<void>,
   ) {
-    const dispatch = await sendPreparedPromptToAgent({
+    const dispatch = await sendPromptToAgent({
       ...dependencies,
+      agentMessages,
       agentId,
       prompt: buildAgentPrompt(input.text, input.images, input.attachments),
+      messageId: input.messageId,
+      clearPendingPermissions: true,
       sessionMode: input.sessionMode,
-      activeTurnBehavior:
-        input.activeTurnBehavior === "queue" ? undefined : input.activeTurnBehavior,
+      activeTurnBehavior: input.activeTurnBehavior === "steer" ? "steer" : "interrupt",
       runOptions: { clientMessageId: input.messageId },
       admit: () => !signal.aborted && !request?.aborted,
       beforeDispatch: async () => {
@@ -209,8 +220,11 @@ export async function openCentralAgents(
     input: AgentCreateRequest,
     agentId: string,
     onReady: (agent: AgentSnapshotPayload) => Promise<void>,
+    resolveAttachments: ResolveAttachments,
     requestSignal?: AbortSignal,
   ) {
+    requireActive(requestSignal);
+    const attachments = await resolveAttachments(input.attachments, requestSignal);
     requireActive(requestSignal);
     const hasPrompt = Boolean(
       input.initialPrompt || input.images?.length || input.attachments?.length,
@@ -234,7 +248,7 @@ export async function openCentralAgents(
         {
           text: input.initialPrompt ?? "",
           images: input.images,
-          attachments: input.attachments,
+          attachments,
           messageId: input.clientMessageId,
         },
         requestSignal,
@@ -246,7 +260,7 @@ export async function openCentralAgents(
     };
   }
 
-  async function createAgent(input: AgentCreateRequest, requestSignal?: AbortSignal) {
+  async function createAgent(input: AgentCreateRequest, requestSignal: AbortSignal, resolveAttachments: ResolveAttachments) {
     requireActive(requestSignal);
     validateAgentCreation(input);
     const { idempotencyKey, requestId: _requestId, subscribe: _subscribe, ...request } = input;
@@ -262,7 +276,7 @@ export async function openCentralAgents(
       agentId: input.agentId,
       exists: async (kind, id) => kind === "agent" && Boolean(await storage.get(id)),
       readAgent,
-      createAgent: (id, _workspace, onReady) => launchAgent(input, id, onReady, requestSignal),
+      createAgent: (id, _workspace, onReady) => launchAgent(input, id, onReady, resolveAttachments, requestSignal),
     });
   }
 
@@ -276,6 +290,7 @@ export async function openCentralAgents(
     },
     input: WorkspaceCreateRequest,
     requestSignal: AbortSignal,
+    resolveAttachments: ResolveAttachments,
     observe?: (snapshot: CreationSnapshot) => void,
   ) {
     requireActive(requestSignal);
@@ -285,7 +300,7 @@ export async function openCentralAgents(
       ...input.agent,
       type: "agent.create.request" as const,
       requestId,
-      config: { ...input.agent.config, cwd: prepared.agentCwd! },
+      config: { ...input.agent.config, cwd: prepared.agentCwd ?? input.agent.config.cwd },
     };
     if (agent) validateAgentCreation(agent);
     return creations.create(
@@ -308,8 +323,17 @@ export async function openCentralAgents(
           return prepared.provision(id);
         },
         createAgent: agent
-          ? (id, workspace, onReady) =>
-              launchAgent({ ...agent, workspaceId: workspace?.id }, id, onReady, requestSignal)
+          ? (id, workspace, onReady) => {
+              const cwd = prepared.agentCwd ?? workspace?.workspaceDirectory;
+              if (!cwd) throw new WorkerOperationError("worker_agent_directory_outside_workspace");
+              return launchAgent(
+                { ...agent, config: { ...agent.config, cwd }, workspaceId: workspace?.id },
+                id,
+                onReady,
+                resolveAttachments,
+                requestSignal,
+              );
+            }
           : undefined,
       },
       observe,
@@ -318,27 +342,66 @@ export async function openCentralAgents(
 
   async function sendMessage(
     input: SendAgentMessageRequest,
-    requestSignal?: AbortSignal,
-  ): Promise<null> {
+    requestSignal: AbortSignal,
+    resolveAttachments: ResolveAttachments,
+    modernTurnBehavior: boolean,
+  ) {
     requireActive(requestSignal);
     if (!input.messageId) throw new WorkerOperationError("worker_message_id_required");
-    if (input.sourceAgentServerId || input.sourceAgentId || input.activeTurnBehavior === "queue") {
+    if (input.sourceAgentServerId && input.sourceAgentServerId !== options.serverId) {
       throw new WorkerOperationError("worker_message_source_unsupported");
+    }
+    if (input.sourceAgentId && !(await readAgent(input.sourceAgentId))) {
+      throw new WorkerOperationError("agent_message_source_not_found");
+    }
+    if (!input.sourceAgentId && input.activeTurnBehavior === "queue") {
+      throw new WorkerOperationError("agent_message_queue_requires_source");
     }
     const request = {
       prompt: buildAgentPrompt(input.text, input.images, input.attachments),
       sourceAgentId: input.sourceAgentId,
       sourceAgentServerId: input.sourceAgentServerId,
       sessionMode: input.sessionMode,
-      activeTurnBehavior: input.activeTurnBehavior ?? "interrupt",
+      activeTurnBehavior: input.activeTurnBehavior ?? (input.sourceAgentId ? "steer" : "interrupt"),
     };
+    type Admission = { activeTurnBehavior: AgentMessageBehavior; guidance: string };
+    let admit!: (receipt: Admission) => void;
+    const admitted = new Promise<Admission>((resolve) => { admit = resolve; });
     try {
-      await receipts.send({
+      const sent = receipts.send({
         agentId: input.agentId,
         messageId: input.messageId,
         request,
-        send: (beforeDispatch) => sendPrompt(input.agentId, input, requestSignal, beforeDispatch),
+        send: async (beforeDispatch) => {
+          const attachments = await resolveAttachments(input.attachments, requestSignal);
+          if (input.sourceAgentId) {
+            requireActive(requestSignal);
+            await beforeDispatch();
+            requireActive(requestSignal);
+            const behavior = input.activeTurnBehavior;
+            const receipt = agentMessages.enqueue({
+              recipientId: input.agentId,
+              messageId: input.messageId,
+              prompt: buildAgentPrompt(input.text, input.images, attachments),
+              source: {
+                kind: "agent-message",
+                agentId: input.sourceAgentId,
+                serverId: input.sourceAgentServerId,
+                title: manager.getAgent(input.sourceAgentId)?.config.title ?? undefined,
+              },
+              activeTurnBehavior: modernTurnBehavior ? behavior ?? "queue" :
+                behavior === "interrupt" ? "interrupt" : "queue",
+              sessionMode: input.sessionMode,
+              clearPendingPermissions: false,
+            });
+            admit({ activeTurnBehavior: receipt.activeTurnBehavior, guidance: receipt.guidance });
+            await receipt.dispatched;
+            return;
+          }
+          return sendPrompt(input.agentId, { ...input, attachments }, requestSignal, beforeDispatch);
+        },
       });
+      return await Promise.race([sent, admitted]);
     } catch (error) {
       if (
         error instanceof Error &&
@@ -349,7 +412,6 @@ export async function openCentralAgents(
       logger.warn({ err: error, agentId: input.agentId }, "Worker prompt dispatch failed");
       throw error;
     }
-    return null;
   }
 
   let closing: Promise<void> | undefined;
@@ -357,6 +419,7 @@ export async function openCentralAgents(
     return (closing ??= (async () => {
       catalog.destroy();
       stopEvents();
+      await agentMessages.close();
       manager.prepareForShutdown();
       const closed = await Promise.allSettled(
         manager.listAgents({ includeInternal: true }).map((agent) => manager.closeAgent(agent.id)),
@@ -384,6 +447,26 @@ export async function openCentralAgents(
     timelineHead: (agentId: string) => manager.getLoadedTimelineHead(agentId),
     manager,
     catalog,
+    createArchiveSession(
+      options: Omit<Parameters<typeof createCentralWorkspaceArchive>[0],
+        "agentManager" | "agentStorage" | "logger" | "unarchiveAgent">,
+    ) {
+      return createCentralWorkspaceArchive({
+        ...dependencies,
+        ...options,
+        unarchiveAgent: (id) => unarchiveAgentState(storage, manager, id),
+      });
+    },
+    createHistorySession(
+      workspaceProvisioning: Parameters<typeof createCentralHistory>[0]["workspaceProvisioning"],
+    ) {
+      return createCentralHistory({
+        ...dependencies,
+        providerSnapshotManager: catalog,
+        workspaceProvisioning,
+        agentPayload: async (snapshot) => snapshotAgent(snapshot, await storage.get(snapshot.id)),
+      });
+    },
     createAgent,
     createWorkspace,
     sendMessage,
