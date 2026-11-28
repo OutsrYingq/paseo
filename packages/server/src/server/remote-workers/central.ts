@@ -155,6 +155,7 @@ export async function startRemoteCentral(options: CentralOptions) {
       },
       connection.signal,
     );
+    const directory = opened.then((agents) => createCentralDirectory(logger, state, agents, connection));
     plugins = new RemotePluginClient({
       scope: execution.target,
       signal: connection.signal,
@@ -171,6 +172,7 @@ export async function startRemoteCentral(options: CentralOptions) {
           target: execution.target,
           version: options.version,
           scope: () => opened,
+          directory: () => directory,
         });
       },
     });
@@ -195,11 +197,12 @@ export async function startRemoteCentral(options: CentralOptions) {
     });
     const scope = opened.then(async (value) => {
       await Promise.all([terminals.initialize(), refreshPlugins()]);
+      const workerDirectory = await directory;
       return Object.assign(value, {
         connection,
         terminals,
         plugins,
-        directory: createCentralDirectory(logger, state, value, connection),
+        directory: workerDirectory,
       });
     });
     scopeByTarget.set(execution, scope);
