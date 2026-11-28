@@ -136,10 +136,15 @@ const OMP_CORE_CAPABILITIES: AgentCapabilityFlags = {
   supportsRewindBoth: false,
 };
 
+type OmpHistoryReader = (sessionFile: string, activeBranchEntryId?: string) => AsyncGenerator<AgentStreamEvent>;
+
 export interface OmpAgentClientOptions {
+  readHistory?: OmpHistoryReader;
   logger: Logger;
   runtimeSettings?: ProviderRuntimeSettings;
   runtime?: OmpRuntime;
+  executionIsRemote?: boolean;
+  resolveCatalogHome?: () => Promise<string>;
   providerIdleScheduler?: OmpProviderIdleScheduler;
   noTurnScheduler?: OmpNoTurnScheduler;
   usagePollScheduler?: OmpUsagePollScheduler;
@@ -201,6 +206,7 @@ interface StartTurnResult {
 }
 
 interface OmpAgentSessionOptions {
+  readHistory?: OmpHistoryReader;
   runtimeSession: OmpRuntimeSession;
   hostTools?: OmpHostToolRouter;
   restartRuntime: (
@@ -602,6 +608,7 @@ class OmpHistorySession implements AgentSession {
     private readonly sessionFile: string,
     provider: AgentProvider,
     private readonly bridgedTools: ReadonlyMap<string, OmpBridgedToolIdentity>,
+    private readonly readHistory?: OmpHistoryReader,
   ) {
     this.provider = provider;
   }
@@ -623,6 +630,10 @@ class OmpHistorySession implements AgentSession {
   }
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+    if (this.readHistory) {
+      yield* this.readHistory(this.sessionFile);
+      return;
+    }
     yield* streamOmpHistory({
       sessionFile: this.sessionFile,
       provider: this.provider,
@@ -731,7 +742,10 @@ export class OmpAgentSession implements AgentSession {
     };
   }
 
+  private readonly readHistory?: OmpHistoryReader;
+
   constructor(options: OmpAgentSessionOptions) {
+    this.readHistory = options.readHistory;
     this.runtimeSession = options.runtimeSession;
     this.hostTools = options.hostTools;
     this.restartRuntime = options.restartRuntime;
@@ -1022,13 +1036,17 @@ export class OmpAgentSession implements AgentSession {
   }
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
-    const replay = yield* streamOmpHistory({
+    if (this.readHistory) {
+      if (this.state.sessionFile) yield* this.readHistory(this.state.sessionFile, this.runtimeSession.activeBranchEntryId);
+    } else {
+      const replay = yield* streamOmpHistory({
       sessionFile: this.state.sessionFile,
       runtimeSession: this.runtimeSession,
       provider: this.provider,
       bridgedTools: this.hostTools?.bridge?.toolIdentities(),
-    });
-    this.lastReply ??= replay.lastReply;
+      });
+      this.lastReply ??= replay.lastReply;
+    }
     const stats = await this.runtimeSession.getSessionStats().catch((error: unknown) => {
       this.logger.debug({ err: error }, "OMP session stats unavailable for history");
       return null;
@@ -2350,6 +2368,9 @@ export class OmpAgentClient implements AgentClient {
   private readonly usagePollScheduler?: OmpUsagePollScheduler;
   private readonly providerIdleDeadlineMs?: number;
   private readonly runtime?: OmpRuntime;
+  private readonly executionIsRemote: boolean;
+  private readonly resolveCatalogHome?: () => Promise<string>;
+  private readonly readHistory?: OmpHistoryReader;
 
   constructor(options: OmpAgentClientOptions) {
     const runtimeSettings = mergeOmpRuntimeSettings(
@@ -2369,6 +2390,9 @@ export class OmpAgentClient implements AgentClient {
     this.usagePollScheduler = options.usagePollScheduler;
     this.providerIdleDeadlineMs = options.providerIdleDeadlineMs;
     this.runtime = options.runtime;
+    this.executionIsRemote = options.executionIsRemote ?? false;
+    this.resolveCatalogHome = options.resolveCatalogHome;
+    this.readHistory = options.readHistory;
   }
 
   private async configureNativePaseoTools(
@@ -2377,6 +2401,7 @@ export class OmpAgentClient implements AgentClient {
     config: AgentSessionConfig,
     launch: Pick<OmpStartSessionInput, "env" | "wrap">,
   ): Promise<OmpHostToolRouter | undefined> {
+    if (this.executionIsRemote) return undefined;
     if (!catalog && !config.mcpServers) {
       return;
     }
@@ -2416,6 +2441,7 @@ export class OmpAgentClient implements AgentClient {
   ): Promise<AgentSession> {
     const launchMode = this.resolveLaunchMode(config.modeId, config.providerOptions);
     const startInput: OmpStartSessionInput = {
+      agentId: launchContext?.agentId,
       cwd: config.cwd,
       protocolMode: "rpc-ui",
       model: config.model,
@@ -2448,6 +2474,7 @@ export class OmpAgentClient implements AgentClient {
         await runtimeSession.getState(),
       );
       return new OmpAgentSession({
+        readHistory: this.readHistory,
         runtimeSession,
         hostTools,
         restartRuntime: this.buildRestartRuntime(startInput, config, launchContext),
@@ -2488,6 +2515,7 @@ export class OmpAgentClient implements AgentClient {
         sessionFile,
         this.provider,
         persistenceMetadata.bridgedTools,
+        this.readHistory,
       );
     }
 
@@ -2501,6 +2529,7 @@ export class OmpAgentClient implements AgentClient {
       launchContext,
       launchMode,
     });
+    startInput.agentId = launchContext?.agentId;
     const runtimeSession = await this.resolveRuntime(
       resumeConfig.config.providerOptions,
     ).startSession(startInput);
@@ -2519,6 +2548,7 @@ export class OmpAgentClient implements AgentClient {
       };
       const initialState = await this.restoreFastMode(runtimeSession, config, resumedState);
       return new OmpAgentSession({
+        readHistory: this.readHistory,
         runtimeSession,
         hostTools,
         restartRuntime: this.buildRestartRuntime(startInput, config, launchContext),
@@ -2619,7 +2649,7 @@ export class OmpAgentClient implements AgentClient {
     try {
       await runProviderRefreshActivity(context, "runtime.start", async () => {
         runtimeSession = await this.resolveRuntime(options.providerOptions).startSession({
-          cwd: options.scope === "global" ? homedir() : options.cwd,
+          cwd: options.scope === "global" ? (await this.resolveCatalogHome?.()) ?? homedir() : options.cwd,
           protocolMode: "rpc-ui",
           modeId: launchMode.modeId,
           extraArgs: launchMode.extraArgs,
@@ -2675,6 +2705,7 @@ export class OmpAgentClient implements AgentClient {
   }
 
   async isAvailable(): Promise<boolean> {
+    if (this.executionIsRemote) return true;
     try {
       const launch = await this.resolveOmpLaunch();
       const availability = await checkProviderLaunchAvailable(launch);

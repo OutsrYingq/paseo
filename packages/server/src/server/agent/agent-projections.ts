@@ -494,8 +494,12 @@ function sanitizePersistenceHandle(
     sanitized.nativeHandle = handle.nativeHandle;
   }
   const metadata = sanitizeMetadata(handle.metadata);
-  if (metadata !== undefined) {
-    sanitized.metadata = metadata;
+  const pluginPersistence = sanitizeOptionalJson(handle.metadata?.pluginProviderPersistence, true);
+  if (metadata !== undefined || pluginPersistence !== undefined) {
+    sanitized.metadata = {
+      ...metadata,
+      ...(pluginPersistence !== undefined ? { pluginProviderPersistence: pluginPersistence } : {}),
+    };
   }
   return sanitized;
 }
@@ -536,7 +540,7 @@ function sanitizeEffectiveOptions(options: Record<string, unknown>): ProviderOpt
   return sanitized && isJsonObject(sanitized) ? sanitized : {};
 }
 
-function sanitizeOptionalJson(value: unknown): JsonValue | undefined {
+function sanitizeOptionalJson(value: unknown, preserveEmptyObjects = false): JsonValue | undefined {
   if (value === undefined) {
     return undefined;
   }
@@ -545,7 +549,7 @@ function sanitizeOptionalJson(value: unknown): JsonValue | undefined {
   }
   if (Array.isArray(value)) {
     const sanitized = value
-      .map((item) => sanitizeOptionalJson(item))
+      .map((item) => sanitizeOptionalJson(item, preserveEmptyObjects))
       .filter((item) => item !== undefined);
     return sanitized;
   }
@@ -555,12 +559,12 @@ function sanitizeOptionalJson(value: unknown): JsonValue | undefined {
   if (typeof value === "object") {
     const result: { [key: string]: JsonValue } = {};
     for (const [key, val] of Object.entries(value)) {
-      const sanitized = sanitizeOptionalJson(val);
+      const sanitized = sanitizeOptionalJson(val, preserveEmptyObjects);
       if (sanitized !== undefined) {
         result[key] = sanitized;
       }
     }
-    return Object.keys(result).length ? result : undefined;
+    return preserveEmptyObjects || Object.keys(result).length ? result : undefined;
   }
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
     return value;

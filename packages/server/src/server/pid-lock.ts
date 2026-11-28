@@ -155,6 +155,7 @@ function resolveOwnerPid(ownerPid?: number): number {
 
 interface AcquirePidLockOptions {
   ownerPid?: number;
+  exclusive?: boolean;
 }
 
 export function isSamePidLock(left: PidLockInfo, right: PidLockInfo): boolean {
@@ -172,9 +173,10 @@ async function clearExistingPidLock(
   pidPath: string,
   existingLock: PidLockInfo,
   lockOwnerPid: number,
+  exclusive: boolean,
 ): Promise<"already_owned" | "cleared"> {
   const lockOwnerRunning = isPidLockOwnerRunning(existingLock);
-  if (existingLock.pid === lockOwnerPid && lockOwnerRunning) {
+  if (!exclusive && existingLock.pid === lockOwnerPid && lockOwnerRunning) {
     await touchPidLockFile(pidPath);
     return "already_owned";
   }
@@ -239,7 +241,12 @@ export async function acquirePidLock(
   // Check if existing lock is stale
   const lockOwnerPid = resolveOwnerPid(options?.ownerPid);
   if (existingLock) {
-    const result = await clearExistingPidLock(pidPath, existingLock, lockOwnerPid);
+    const result = await clearExistingPidLock(
+      pidPath,
+      existingLock,
+      lockOwnerPid,
+      options?.exclusive ?? false,
+    );
     if (result === "already_owned") {
       return;
     }
@@ -326,7 +333,8 @@ export function startPidLockHeartbeat(
   options?: {
     ownerPid?: number;
     intervalMs?: number;
-    onError?: (error: unknown) => void;
+    keepAlive?: boolean;
+    onError?: (error: unknown) => void | Promise<void>;
   },
 ): () => void {
   const intervalMs = options?.intervalMs ?? PID_LOCK_HEARTBEAT_INTERVAL_MS;
@@ -340,8 +348,7 @@ export function startPidLockHeartbeat(
     refreshPidLock(paseoHome, { ownerPid: options?.ownerPid })
       .catch((error) => {
         if (options?.onError) {
-          options.onError(error);
-          return;
+          return options.onError(error);
         }
         const message = error instanceof Error ? error.message : String(error);
         process.stderr.write(`PID lock heartbeat failed: ${message}\n`);
@@ -350,7 +357,7 @@ export function startPidLockHeartbeat(
         refreshing = false;
       });
   }, intervalMs);
-  timer.unref();
+  if (!options?.keepAlive) timer.unref();
 
   return () => clearInterval(timer);
 }

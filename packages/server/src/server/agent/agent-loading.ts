@@ -23,7 +23,7 @@ interface PendingAgentInitialization {
   options: { broadcastTimeline: boolean };
 }
 
-const pendingAgentInitializations = new Map<string, PendingAgentInitialization>();
+const pendingByManager = new WeakMap<AgentLoaderManager, Map<string, PendingAgentInitialization>>();
 
 export type AgentLoaderManager = Pick<
   AgentManager,
@@ -73,6 +73,11 @@ export async function ensureAgentLoaded(
 ): Promise<ManagedAgent> {
   await deps.agentManager.waitForAgentClose?.(agentId);
 
+  let pendingAgentInitializations = pendingByManager.get(deps.agentManager);
+  if (!pendingAgentInitializations) {
+    pendingAgentInitializations = new Map();
+    pendingByManager.set(deps.agentManager, pendingAgentInitializations);
+  }
   const inflight = pendingAgentInitializations.get(agentId);
   if (inflight) {
     inflight.options.broadcastTimeline ||= deps.broadcastTimeline === true;

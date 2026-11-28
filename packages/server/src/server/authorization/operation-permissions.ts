@@ -526,5 +526,11 @@ export function requiredPermissionForOutbound(
     (message.payload.status === "agent_created" || message.payload.status === "agent_create_failed")
   )
     return ["workspace.write", "hub.execute"];
+  if (message.type === "status" && message.payload.status === "agent_refreshed") {
+    return "workspace.write";
+  }
+  if (message.type === "status" && message.payload.status === "restart_requested") {
+    return "daemon.manage";
+  }
   return OUTBOUND_PERMISSION[message.type];
 }

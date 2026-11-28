@@ -128,6 +128,30 @@ export function parseStoredAgentRecord(value: unknown): StoredAgentRecord {
   return STORED_AGENT_SCHEMA.parse(value);
 }
 
+type AgentStorageEntry = Pick<Dirent, "name" | "isFile" | "isDirectory">;
+
+export interface AgentStorageFiles {
+  list(path: string): Promise<AgentStorageEntry[]>;
+  read(path: string): Promise<string>;
+  write(path: string, record: StoredAgentRecord): Promise<void>;
+  unlink(path: string): Promise<void>;
+  isSameFile(left: string, right: string): Promise<boolean>;
+}
+
+const localAgentStorageFiles: AgentStorageFiles = {
+  list: (directory) => fs.readdir(directory, { withFileTypes: true }),
+  read: (file) => fs.readFile(file, "utf8"),
+  write: writeJsonFileAtomic,
+  unlink: fs.unlink,
+  async isSameFile(left, right) {
+    const [a, b] = await Promise.all([
+      fs.lstat(left, { bigint: true }),
+      fs.lstat(right, { bigint: true }),
+    ]);
+    return a.dev === b.dev && a.ino === b.ino;
+  },
+};
+
 export class AgentStorage {
   private cache: Map<string, StoredAgentRecord> = new Map();
   private pathById: Map<string, string> = new Map();
@@ -146,7 +170,7 @@ export class AgentStorage {
   private loadPromise: Promise<void> | null = null;
   private logger: Logger;
 
-  constructor(baseDir: string, logger: Logger) {
+  constructor(baseDir: string, logger: Logger, private readonly files = localAgentStorageFiles) {
     this.baseDir = baseDir;
     this.logger = logger.child({ module: "agent", component: "agent-storage" });
   }
@@ -335,19 +359,15 @@ export class AgentStorage {
     const nextPath = this.buildRecordPath(record);
     const previousPath = this.pathById.get(agentId);
 
-    await writeJsonFileAtomic(nextPath, record);
+    await this.files.write(nextPath, record);
     this.addIndexedPath(agentId, nextPath);
 
     if (previousPath && previousPath !== nextPath) {
       try {
         // Compare the entries after the atomic replacement. On a case-insensitive
         // volume both spellings can now address the file we just wrote.
-        const [previous, next] = await Promise.all([
-          fs.lstat(previousPath, { bigint: true }),
-          fs.lstat(nextPath, { bigint: true }),
-        ]);
-        if (previous.dev !== next.dev || previous.ino !== next.ino) {
-          await fs.unlink(previousPath);
+        if (!(await this.files.isSameFile(previousPath, nextPath))) {
+          await this.files.unlink(previousPath);
         }
       } catch {
         // ignore cleanup errors
@@ -372,7 +392,7 @@ export class AgentStorage {
     await Promise.all(
       paths.map(async (filePath) => {
         try {
-          await fs.unlink(filePath);
+          await this.files.unlink(filePath);
         } catch (error) {
           const code = (error as NodeJS.ErrnoException).code;
           if (code && code !== "ENOENT") {
@@ -478,9 +498,9 @@ export class AgentStorage {
   }
 
   private async scanDisk(): Promise<void> {
-    let entries: Dirent[] = [];
+    let entries: AgentStorageEntry[] = [];
     try {
-      entries = await fs.readdir(this.baseDir, { withFileTypes: true });
+      entries = await this.files.list(this.baseDir);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         return;
@@ -499,7 +519,7 @@ export class AgentStorage {
     const projectFileLists = await Promise.all(
       projectDirs.map(async (projectDir) => {
         try {
-          const files = await fs.readdir(projectDir, { withFileTypes: true });
+          const files = await this.files.list(projectDir);
           return files
             .filter((file) => file.isFile() && file.name.endsWith(".json"))
             .map((file) => path.join(projectDir, file.name));
@@ -529,7 +549,7 @@ export class AgentStorage {
 
   private async readRecordFile(filePath: string): Promise<StoredAgentRecord | null> {
     try {
-      const content = await fs.readFile(filePath, "utf8");
+      const content = await this.files.read(filePath);
       const parsed = JSON.parse(content);
       return parseStoredAgentRecord(parsed);
     } catch (error) {

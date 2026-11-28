@@ -9,6 +9,23 @@ const ReceiptSchema = z.object({
   state: z.enum(["pending", "completed"]),
   agentId: z.string(),
 });
+export interface MessageReceiptFiles {
+  read(file: string): Promise<string | null>;
+  write(file: string, value: z.infer<typeof ReceiptSchema>): Promise<void>;
+}
+const localReceiptFiles: MessageReceiptFiles = {
+  async read(file) {
+    try {
+      return await readFile(file, "utf8");
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT")
+        return null;
+      throw error;
+    }
+  },
+  write: writeJsonFileAtomic,
+};
+
 interface SendMessageInput {
   agentId: string;
   messageId: string;
@@ -23,7 +40,7 @@ interface SendMessageInput {
 /** Owns message delivery receipts; creation is owned by CreationService. */
 export class MessageReceipts {
   private readonly pending = new Map<string, Promise<void>>();
-  constructor(private readonly directory: string) {}
+  constructor(private readonly directory: string, private readonly files = localReceiptFiles) {}
 
   send(input: SendMessageInput): Promise<void> {
     // Preserve the existing on-disk identity and shape across daemon upgrades.
@@ -44,7 +61,8 @@ export class MessageReceipts {
   private async sendOnce(key: string, input: SendMessageInput): Promise<void> {
     const file = path.join(this.directory, `${key}.json`);
     const fingerprint = digest(input.request);
-    const existing = await readReceipt(file);
+    const text = await this.files.read(file);
+    const existing = text === null ? null : ReceiptSchema.parse(JSON.parse(text));
     if (existing) {
       if (existing.fingerprint !== fingerprint) throw new Error("agent_request_key_conflict");
       if (existing.state === "completed") return;
@@ -54,19 +72,10 @@ export class MessageReceipts {
     const receipt = { fingerprint, agentId: input.agentId };
     let pending: Promise<void> | null = null;
     await input.send(() => {
-      pending ??= writeJsonFileAtomic(file, { ...receipt, state: "pending" });
+      pending ??= this.files.write(file, { ...receipt, state: "pending" });
       return pending;
     });
-    await writeJsonFileAtomic(file, { ...receipt, state: "completed" });
-  }
-}
-
-async function readReceipt(file: string): Promise<z.infer<typeof ReceiptSchema> | null> {
-  try {
-    return ReceiptSchema.parse(JSON.parse(await readFile(file, "utf8")));
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
-    throw error;
+    await this.files.write(file, { ...receipt, state: "completed" });
   }
 }
 

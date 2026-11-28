@@ -238,12 +238,13 @@ async function resolveResumePurpose(
   record: StoredAgentRecord | null,
   requested: AgentResumePurpose | undefined,
   cwd: string,
+  inspectDirectory: (cwd: string) => Promise<unknown> = stat,
 ): Promise<AgentResumePurpose> {
   if (!record) return requested ?? "interactive";
   if (record.archivedAt) return "history";
   if (requested !== "history") return "interactive";
   try {
-    await stat(cwd);
+    await inspectDirectory(cwd);
     return "interactive";
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return "history";
@@ -410,6 +411,7 @@ export interface CreateAgentOptions {
 }
 
 export interface AgentManagerOptions {
+  workspacePaths?: { resolve(cwd: string): string; inspectDirectory(cwd: string): Promise<void> };
   pluginLifecycle?: PluginLifecycle;
   /** An internal workspace makes every agent created inside it internal. */
   clients?: ProviderClientMap;
@@ -977,7 +979,10 @@ export class AgentManager {
   private readonly beforeSteerUnavailableFallback?: AgentManagerOptions["beforeSteerUnavailableFallback"];
   private acceptingAgentRegistrations = true;
 
+  private readonly workspacePaths?: AgentManagerOptions["workspacePaths"];
+
   constructor(options: AgentManagerOptions) {
+    this.workspacePaths = options.workspacePaths;
     this.pluginLifecycle = options.pluginLifecycle;
     this.pluginSessions = options.pluginSessions;
     this.timelineStore = options.timelineStore ?? new InMemoryAgentTimelineStore();
@@ -1880,7 +1885,9 @@ export class AgentManager {
     // settled before the config is prepared, because a history load reads an archived
     // agent whose working directory may be gone.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
-    const purpose = await resolveResumePurpose(record, resumeOptions?.purpose, mergedConfig.cwd);
+    const purpose = await resolveResumePurpose(
+      record, resumeOptions?.purpose, mergedConfig.cwd, this.workspacePaths?.inspectDirectory,
+    );
     const currentResumeOptions = { purpose } satisfies AgentResumeSessionOptions;
 
     const launchEnv = record?.launchEnv;
@@ -6521,12 +6528,12 @@ export class AgentManager {
 
     // Always resolve cwd to absolute path for consistent history file lookup
     if (normalized.cwd) {
-      normalized.cwd = resolve(normalized.cwd);
+      normalized.cwd = this.workspacePaths?.resolve(normalized.cwd) ?? resolve(normalized.cwd);
       // Only a session that will run in the directory needs it to still be there. Reading
       // an archived agent's history runs nothing, and must survive the worktree it ran in
       // being removed when its workspace was archived.
       if (options.purpose !== "history") {
-        await assertUsableWorkingDirectory(normalized.cwd);
+        await (this.workspacePaths?.inspectDirectory ?? assertUsableWorkingDirectory)(normalized.cwd);
       }
     }
 
