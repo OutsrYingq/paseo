@@ -11,7 +11,7 @@ import {
 } from "./session/workspace-base-branch/service.js";
 import type { WorkspaceBaseBranchSetRequest } from "@getpaseo/protocol/messages";
 
-import { searchTimeline } from "./agent/chat-search/index.js";
+import { queryAgentTimeline } from "./session/agent-history/timeline-query.js";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import { BrowserAutomationHostCapabilitySchema } from "@getpaseo/protocol/browser-automation/capabilities";
 import type {
@@ -129,7 +129,6 @@ import {
 } from "./workspace-labels/index.js";
 
 import { AgentManager, AgentRunCancellationError } from "./agent/agent-manager.js";
-import { buildTimelinePromptIndex } from "./agent/timeline-prompt-index.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type {
   AgentManagerEvent,
@@ -3264,9 +3263,12 @@ export class Session {
       case "agent.timeline.append.request":
         return this.handleAgentTimelineAppendRequest(msg);
       case "agent.timeline.search.request":
-        return this.handleAgentTimelineSearchRequest(msg, source);
       case "agent.timeline.list_prompts.request":
-        return this.handleAgentTimelineListPromptsRequest(msg, source);
+        return queryAgentTimeline({
+          agentManager: this.agentManager,
+          agentStorage: this.agentStorage,
+          logger: this.sessionLogger,
+        }, msg).then((response) => this.emitForSource(response, source));
       case "agent.provider_subagents.list.request":
         return this.handleProviderSubagentListRequest(msg);
       case "agent.background_work.list.request":
@@ -8604,108 +8606,6 @@ export class Session {
       type: "agent.timeline.append.response",
       payload: { requestId: msg.requestId, seq, epoch },
     });
-  }
-
-  private async handleAgentTimelineSearchRequest(
-    msg: Extract<SessionInboundMessage, { type: "agent.timeline.search.request" }>,
-    source?: object,
-  ): Promise<void> {
-    try {
-      await ensureAgentLoaded(msg.agentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
-      const rows = await this.agentManager.getTimelineRows(msg.agentId);
-      const { epoch } = this.agentManager.fetchTimeline(msg.agentId, {
-        direction: "tail",
-        limit: 1,
-      });
-      const result = await searchTimeline({ rows, query: msg.query, cursor: msg.cursor });
-      if (
-        this.agentManager.fetchTimeline(msg.agentId, { direction: "tail", limit: 1 }).epoch !==
-        epoch
-      ) {
-        throw new Error("History changed; search again");
-      }
-      this.emitForSource(
-        {
-          type: "agent.timeline.search.response",
-          payload: {
-            requestId: msg.requestId,
-            agentId: msg.agentId,
-            epoch,
-            ...result,
-            error: null,
-          },
-        },
-        source,
-      );
-    } catch (error) {
-      this.emitForSource(
-        {
-          type: "agent.timeline.search.response",
-          payload: {
-            requestId: msg.requestId,
-            agentId: msg.agentId,
-            epoch: "",
-            locations: [],
-            nextCursor: null,
-            error: error instanceof Error ? error.message : String(error),
-          },
-        },
-        source,
-      );
-    }
-  }
-
-  private async handleAgentTimelineListPromptsRequest(
-    msg: Extract<SessionInboundMessage, { type: "agent.timeline.list_prompts.request" }>,
-    source?: object,
-  ): Promise<void> {
-    try {
-      await ensureAgentLoaded(msg.agentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
-      const rows = await this.agentManager.getTimelineRows(msg.agentId);
-      const timeline = this.agentManager.fetchTimeline(msg.agentId, {
-        direction: "tail",
-        limit: 1,
-      });
-      const index = buildTimelinePromptIndex(timeline.epoch, rows);
-      this.emitForSource(
-        {
-          type: "agent.timeline.list_prompts.response",
-          payload: {
-            requestId: msg.requestId,
-            agentId: msg.agentId,
-            ...index,
-            error: null,
-          },
-        },
-        source,
-      );
-    } catch (error) {
-      this.sessionLogger.error(
-        { err: error, agentId: msg.agentId },
-        "Failed to handle agent.timeline.list_prompts.request",
-      );
-      this.emitForSource(
-        {
-          type: "agent.timeline.list_prompts.response",
-          payload: {
-            requestId: msg.requestId,
-            agentId: msg.agentId,
-            epoch: "",
-            prompts: [],
-            error: error instanceof Error ? error.message : String(error),
-          },
-        },
-        source,
-      );
-    }
   }
 
   private async handleProviderSubagentListRequest(
