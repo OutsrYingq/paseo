@@ -3,14 +3,8 @@ import {
   ChunkedTransportProtocolError,
 } from "@getpaseo/protocol/chunked-transport";
 import { type WorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
-import {
-  createAgentMessageDelivery,
-  type AgentMessageDelivery,
-} from "./agent/agent-messages/index.js";
-import {
-  sendPreparedPromptToAgent,
-  waitForAgentRunStartWithTimeout,
-} from "./agent/agent-prompt.js";
+import type { AgentMessageDelivery } from "./agent/agent-messages/index.js";
+import { createManagerMessageDelivery } from "./agent/agent-messages/manager-delivery.js";
 import { createToolHosts } from "./agent/host-operations/index.js";
 import { HOST_ROUTE_OPCODE } from "@getpaseo/protocol/binary-frames/index";
 import { DaemonLinkEndpoint, VirtualHostSocket } from "./connected-hosts/index.js";
@@ -770,51 +764,10 @@ export class VoiceAssistantWebSocketServer {
     this.orchestrationSkills = orchestrationSkills;
     this.agentManager = agentManager;
     this.agentStorage = agentStorage;
-    this.agentMessages = createAgentMessageDelivery({
-      tryRunOutOfBand: (request, onAccepted) =>
-        agentManager.tryRunOutOfBand(
-          request.recipientId,
-          request.prompt,
-          { clientMessageId: request.messageIds[0] },
-          onAccepted,
-        ),
-      isRunning: (agentId) => agentManager.hasInFlightRun(agentId),
-      canSteer: (agentId) => agentManager.canSteer(agentId),
-      hasPendingPermission: (agentId) => agentManager.hasPendingPermissions(agentId),
-      subscribe: (notify) =>
-        agentManager.subscribe(
-          (event) => {
-            if (event.type === "agent_state") notify(event.agent.id);
-          },
-          { replayState: false },
-        ),
-      onStop: (notify) => agentManager.onStop(notify),
-      dispatch: async (batch) => {
-        const dispatch = await sendPreparedPromptToAgent({
-          agentManager,
-          agentStorage,
-          agentId: batch.recipientId,
-          prompt: batch.prompt,
-          activeTurnBehavior: batch.activeTurnBehavior,
-          idleOnly: batch.idleOnly,
-          admit: batch.admit,
-          sessionMode: batch.sessionMode,
-          clearPendingPermissions: batch.clearPendingPermissions,
-          unarchive: batch.unarchive,
-          runOptions: { clientMessageId: batch.messageIds[0] },
-          logger: this.logger,
-        });
-        if (dispatch.disposition === "turn_started")
-          await waitForAgentRunStartWithTimeout(agentManager, batch.recipientId, dispatch.started);
-        return dispatch.disposition;
-      },
-      awaitStart: (agentId, started) =>
-        waitForAgentRunStartWithTimeout(agentManager, agentId, started),
-      onError: (err, batch) =>
-        this.logger.error(
-          { err, agentId: batch.recipientId, messageIds: batch.messageIds },
-          "Agent message batch dispatch failed",
-        ),
+    this.agentMessages = createManagerMessageDelivery({
+      agentManager,
+      agentStorage,
+      logger: this.logger,
     });
     this.messageReceipts = new MessageReceipts(join(paseoHome, "agent-requests"));
     this.creationService = new CreationService(
