@@ -468,11 +468,42 @@ export async function startRemoteCentral(options: CentralOptions) {
           },
         },
       });
+      const agentConfigSession = scope.createAgentConfigSession(sendAuthorized);
       catalogSession.start();
       const detached = () => socket.close(1013, "Worker lease ended");
+      function deliverPermissionEvent(event: CentralTimelineUpdate) {
+        if (
+          event.type === "agent_stream" &&
+          (event.payload.event.type === "permission_requested" ||
+            event.payload.event.type === "permission_resolved") &&
+          scope.manager.getAgent(event.payload.agentId)?.internal !== true
+        ) {
+          const { agentId, event: stream } = event.payload;
+          for (const [subscriptionId, events] of eventSubscriptions) {
+            if (stream.type === "permission_requested" && events.has("agent_permission_request")) {
+              sendAuthorized({
+                type: "agent_permission_request",
+                payload: { agentId, request: stream.request, subscriptionId },
+              });
+            }
+            if (stream.type === "permission_resolved" && events.has("agent_permission_resolved")) {
+              sendAuthorized({
+                type: "agent_permission_resolved",
+                payload: {
+                  agentId,
+                  requestId: stream.requestId,
+                  resolution: stream.resolution,
+                  subscriptionId,
+                },
+              });
+            }
+          }
+        }
+      }
       const deliver = (event: CentralTimelineUpdate | typeof connectionLostEvent) => {
         if (event === connectionLostEvent) return socket.close(1013, "Worker connection lost");
         if (lease.signal.aborted) return;
+        deliverPermissionEvent(event);
         for (const [subscriptionId, ids] of subscriptions) {
           if (!ids.has(event.payload.agentId)) continue;
           if (event.type === "agent_stream") {
@@ -551,6 +582,56 @@ export async function startRemoteCentral(options: CentralOptions) {
         for (const update of updates) sendAuthorized(update);
       }
 
+      async function updateAgent(
+        operation: Extract<SessionInboundMessage, { type: "update_agent_request" }>,
+      ) {
+        const { requestId, agentId } = operation;
+        const result = await scope.updateAgent(operation).catch((error: unknown) => ({
+          accepted: false,
+          error: error instanceof Error ? error.message : "Failed to update agent",
+        }));
+        sendAuthorized({
+          type: "update_agent_response",
+          payload: { requestId, agentId, ...result },
+        });
+      }
+
+      async function clearAgentAttention(
+        operation: Extract<SessionInboundMessage, { type: "clear_agent_attention" }>,
+      ) {
+        const { agentId, requestId } = operation;
+        const ids = Array.isArray(agentId) ? agentId : [agentId];
+        await scope.clearAgentAttention(ids);
+        if (requestId) {
+          const agents = await Promise.all(ids.map((id) => scope.readSnapshot(id)));
+          sendAuthorized({
+            type: "clear_agent_attention_response",
+            payload: { requestId, agentId, agents: agents.filter((agent) => agent !== null) },
+          });
+        }
+      }
+
+      function dispatchAgentCommand(operation: SessionInboundMessage): Promise<void> | undefined {
+        switch (operation.type) {
+          case "set_agent_model_request":
+            return agentConfigSession.handleSetAgentModelRequest(operation);
+          case "set_agent_mode_request":
+            return agentConfigSession.handleSetAgentModeRequest(operation);
+          case "set_agent_thinking_request":
+            return agentConfigSession.handleSetAgentThinkingRequest(operation);
+          case "set_agent_feature_request":
+            return agentConfigSession.handleSetAgentFeatureRequest(operation);
+          case "agent.config.apply.request":
+            return agentConfigSession.handleAgentConfigApplyRequest(operation);
+          case "update_agent_request":
+            return updateAgent(operation);
+          case "clear_agent_attention":
+            return clearAgentAttention(operation);
+          case "agent_permission_response":
+            return scope.respondToPermission(operation);
+        }
+      }
+
       const timelineProjection = {
         reasoningMerge: message.capabilities?.[CLIENT_CAPS.reasoningMergeEnum] === true,
         notification: message.capabilities?.[CLIENT_CAPS.timelineNotifications] === true,
@@ -597,7 +678,8 @@ export async function startRemoteCentral(options: CentralOptions) {
         if (
           operation.type === "project.list.request" ||
           operation.type === "fetch_workspaces_request" ||
-          operation.type === "fetch_agents_request"
+          operation.type === "fetch_agents_request" ||
+          operation.type === "fetch_agent_history_request"
         ) {
           return directory.request(operation);
         }
@@ -618,6 +700,8 @@ export async function startRemoteCentral(options: CentralOptions) {
           return;
         }
         if (operation.type === "creation.subscribe.request") return subscribeCreation(operation);
+        const agentCommand = dispatchAgentCommand(operation);
+        if (agentCommand) return agentCommand;
         const catalog = catalogSession.dispatch(operation);
         if (catalog) return catalog;
         if (terminalSession.handles(operation)) return terminalSession.dispatch(operation);
@@ -867,6 +951,7 @@ async function dispatch(
           type: "rpc_error",
           payload: {
             requestId: message.requestId,
+            requestType: message.type,
             error: "worker_operation_unsupported",
           },
         });

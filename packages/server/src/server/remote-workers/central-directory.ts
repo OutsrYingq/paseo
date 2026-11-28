@@ -13,8 +13,10 @@ import { z } from "zod";
 import type { Logger } from "pino";
 import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 import { DirectorySyncService } from "../directory-sync/index.js";
+import { matchesAgentHistoryQuery } from "../agent-history-search.js";
 import { WorkspaceDirectory } from "../workspace-directory.js";
 import { describeProject } from "../project-descriptor.js";
+import { matchesAgentUpdatesFilter } from "../session/agent-updates/agent-updates-service.js";
 import {
   PersistedProjectRecordSchema,
   PersistedWorkspaceRecordSchema,
@@ -29,7 +31,13 @@ import { WorkerOperationError } from "./execution-protocol.js";
 
 type Request = Extract<
   SessionInboundMessage,
-  { type: "project.list.request" | "fetch_workspaces_request" | "fetch_agents_request" }
+  {
+    type:
+      | "project.list.request"
+      | "fetch_workspaces_request"
+      | "fetch_agents_request"
+      | "fetch_agent_history_request";
+  }
 >;
 
 export function createCentralDirectory(
@@ -127,8 +135,34 @@ export function createCentralDirectory(
     isProviderVisibleToClient: () => true,
     buildWorkspaceDescriptor: describeWorkspace,
   });
+  async function readWorkspaces(
+    request: Extract<Request, { type: "fetch_workspaces_request" }>,
+  ): Promise<DirectoryResponse> {
+    if (request.sync && request.filter) throw new WorkerOperationError("invalid_request");
+    const result = request.sync
+      ? sync.synchronizeWorkspaces(
+          await directory.listDescriptors(),
+          request.sync,
+          request.includeBackground,
+        )
+      : await directory.listFetchEntries({
+          ...request,
+          filter: {
+            ...request.filter,
+            ...(request.includeBackground ? { includeBackground: true } : {}),
+          },
+        });
+    return {
+      type: "fetch_workspaces_response",
+      payload: { requestId: request.requestId, ...result },
+    };
+  }
+
   async function read(request: Request): Promise<DirectoryResponse> {
-    if (request.type === "fetch_agents_request") {
+    if (request.type === "fetch_agents_request" || request.type === "fetch_agent_history_request") {
+      const isHistory = request.type === "fetch_agent_history_request";
+      const search = isHistory ? request.search?.trim() : undefined;
+      const includeBackground = !isHistory && request.includeBackground;
       const [snapshots, workspaceRecords, projectRecords] = await Promise.all([
         agents.listAgents(),
         listWorkspaces(),
@@ -158,23 +192,17 @@ export function createCentralDirectory(
                   mainRepoRoot: null,
                 },
               };
+        const entry = { agent, project: location };
         if (
-          (!filter?.includeArchived && agent.archivedAt) ||
-          (!(request.includeBackground || filter?.includeBackground) &&
-            (agent.background || workspace?.background)) ||
-          (filter?.statuses && !filter.statuses.includes(agent.status)) ||
-          (filter?.projectKeys && !filter.projectKeys.includes(location.projectKey)) ||
-          (filter?.requiresAttention !== undefined &&
-            filter.requiresAttention !== agent.requiresAttention) ||
-          (filter?.thinkingOptionId !== undefined &&
-            filter.thinkingOptionId !== agent.thinkingOptionId) ||
-          (filter?.labels &&
-            !Object.entries(filter.labels).every(([key, value]) => agent.labels[key] === value))
-        )
+          !(includeBackground || filter?.includeBackground) &&
+          (agent.background || workspace?.background)
+        ) {
           return [];
-        return [{ agent, project: location }];
+        }
+        if (!matchesAgentUpdatesFilter({ ...entry, filter })) return [];
+        return search && !matchesAgentHistoryQuery(search, entry) ? [] : [entry];
       });
-      if (request.sync) {
+      if (!isHistory && request.sync) {
         if (request.filter) throw new WorkerOperationError("invalid_request");
         const result = sync.synchronizeAgents(entries, request.sync, request.includeBackground);
         return {
@@ -202,7 +230,7 @@ export function createCentralDirectory(
       const hasMore = candidates.length > limit;
       const nextCursor = hasMore ? agentPager.encode(page.at(-1)!.agent, sort) : null;
       return {
-        type: "fetch_agents_response",
+        type: isHistory ? "fetch_agent_history_response" : "fetch_agents_response",
         payload: {
           requestId: request.requestId,
           entries: page,
@@ -224,29 +252,16 @@ export function createCentralDirectory(
         },
       };
     }
-    if (request.sync && request.filter) throw new WorkerOperationError("invalid_request");
-    const result = request.sync
-      ? sync.synchronizeWorkspaces(
-          await directory.listDescriptors(),
-          request.sync,
-          request.includeBackground,
-        )
-      : await directory.listFetchEntries({
-          ...request,
-          filter: {
-            ...request.filter,
-            ...(request.includeBackground ? { includeBackground: true } : {}),
-          },
-        });
-    return {
-      type: "fetch_workspaces_response",
-      payload: { requestId: request.requestId, ...result },
-    };
+    return readWorkspaces(request);
   }
   async function projectForWorkspace(workspaceId: string) {
-    const [workspaces, projects] = await Promise.all([listWorkspaces(), projectRegistry.list()]);
+    const [workspaces, projectRecords] = await Promise.all([
+      listWorkspaces(),
+      projectRegistry.list(),
+    ]);
     const workspace = workspaces.find((entry) => entry.workspaceId === workspaceId);
-    const project = workspace && projects.find((entry) => entry.projectId === workspace.projectId);
+    const project =
+      workspace && projectRecords.find((entry) => entry.projectId === workspace.projectId);
     return workspace && project ? placement(workspace, project) : null;
   }
   async function prepareWorkspace(request: WorkspaceCreateRequest) {
@@ -286,7 +301,7 @@ export function createCentralDirectory(
           projectId: project.projectId,
           cwd,
           kind: project.kind === "git" ? "local_checkout" : "directory",
-          displayName: cwd.replaceAll("\\", "/").split("/").filter(Boolean).at(-1) ?? cwd,
+          displayName: cwd.replaceAll("\\", "/").split("/").findLast(Boolean) ?? cwd,
           title:
             request.title?.trim() ||
             resolveFirstAgentPromptTitle(
@@ -309,7 +324,13 @@ export function createCentralDirectory(
 
 type DirectoryResponse = Extract<
   SessionOutboundMessage,
-  { type: "project.list.response" | "fetch_workspaces_response" | "fetch_agents_response" }
+  {
+    type:
+      | "project.list.response"
+      | "fetch_workspaces_response"
+      | "fetch_agents_response"
+      | "fetch_agent_history_response";
+  }
 >;
 
 export function createDirectorySubscriptions(options: {
@@ -322,22 +343,32 @@ export function createDirectorySubscriptions(options: {
   const subscriptions = new Map<string, () => void>();
   return {
     async request(request: Request) {
-      if (request.type === "project.list.request" || !request.subscribe) {
+      if (
+        request.type === "project.list.request" ||
+        request.type === "fetch_agent_history_request" ||
+        !request.subscribe
+      ) {
         send(await directory.read(request));
         return;
       }
       if (subscriptions.size >= 64) throw new WorkerOperationError("worker_subscription_limit");
       if (request.subscribe.subscriptionId) throw new WorkerOperationError("invalid_request");
+      const refreshRequest = { ...request, sync: undefined };
       const subscriptionId = randomUUID();
       let stopped = false;
       let reading = true;
       let dirty = false;
-      const entries = (response: DirectoryResponse) =>
-        response.type === "fetch_agents_response"
-          ? response.payload.entries.map((entry) => [entry.agent.id, entry] as const)
-          : response.type === "fetch_workspaces_response"
-            ? response.payload.entries.map((workspace) => [workspace.id, { workspace }] as const)
-            : [];
+      function entries(response: DirectoryResponse) {
+        if (response.type === "fetch_agents_response") {
+          return response.payload.entries.map((entry) => [entry.agent.id, entry] as const);
+        }
+        if (response.type === "fetch_workspaces_response") {
+          return response.payload.entries.map(
+            (workspace) => [workspace.id, { workspace }] as const,
+          );
+        }
+        return [];
+      }
       let previous = new Map<string, ReturnType<typeof entries>[number][1]>();
       const stop = manager.subscribe((event) => {
         if (event.type !== "agent_state" && event.type !== "agent_removed") return;
@@ -357,9 +388,10 @@ export function createDirectorySubscriptions(options: {
       async function refresh() {
         reading = true;
         try {
-          while (dirty && !stopped) {
+          while (dirty) {
+            if (stopped) return;
             dirty = false;
-            const updated = await directory.read({ ...request, sync: undefined });
+            const updated = await directory.read(refreshRequest);
             if (stopped) return;
             const current = new Map<string, ReturnType<typeof entries>[number][1]>(
               entries(updated),
@@ -386,7 +418,11 @@ export function createDirectorySubscriptions(options: {
       }
       try {
         const initial = await directory.read(request);
-        if (stopped || initial.type === "project.list.response") return;
+        if (
+          stopped ||
+          (initial.type !== "fetch_agents_response" && initial.type !== "fetch_workspaces_response")
+        )
+          return;
         previous = new Map<string, ReturnType<typeof entries>[number][1]>(entries(initial));
         if (initial.type === "fetch_agents_response")
           send({ ...initial, payload: { ...initial.payload, subscriptionId } });

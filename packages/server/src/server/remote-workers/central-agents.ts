@@ -16,8 +16,15 @@ import {
   waitForAgentRunStartWithTimeout,
 } from "../agent/agent-prompt.js";
 import type { AgentClient } from "../agent/agent-sdk-types.js";
-import { archiveAgentCommand, cancelAgentRunCommand } from "../agent/lifecycle-command.js";
+import { resolveCreateAgentTitles } from "../agent/create-agent-title.js";
+import {
+  archiveAgentCommand,
+  cancelAgentRunCommand,
+  setAgentModeCommand,
+  updateAgentCommand,
+} from "../agent/lifecycle-command.js";
 import { AgentStorage } from "../agent/agent-storage.js";
+import { respondToAgentPermission } from "../agent/permission-response.js";
 import { buildAgentPrompt } from "../agent/prompt-attachments.js";
 import { ProviderSnapshotManager } from "../agent/provider-snapshot-manager.js";
 import { shutdownAgentClients } from "../agent/provider-registry.js";
@@ -31,7 +38,8 @@ import {
 } from "../persistence-hooks.js";
 import { WorkerOperationError } from "./execution-protocol.js";
 import type { createRemoteState } from "./remote-state.js";
-import { ensureAgentLoaded } from "../agent/agent-loading.js";
+import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "../agent/agent-loading.js";
+import { AgentConfigSession } from "../session/agent-config/agent-config-session.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/protocol/messages";
 
 export type CentralTimelineUpdate = Extract<
@@ -113,14 +121,22 @@ export async function openCentralAgents(
       throw new WorkerOperationError("worker_connection_lost");
   }
 
+  function snapshotAgent(
+    agent: NonNullable<ReturnType<AgentManager["getAgent"]>>,
+    stored: Awaited<ReturnType<AgentStorage["get"]>>,
+  ) {
+    let title = stored?.title;
+    if (!title && (stored?.persistence || agent.lastUserMessageAt)) {
+      const prompt = manager.getTimeline(agent.id).find((item) => item.type === "user_message");
+      title = resolveCreateAgentTitles({ initialPrompt: prompt?.text }).provisionalTitle;
+    }
+    return serializeAgentSnapshot(agent, { title, archivedAt: stored?.archivedAt });
+  }
+
   async function readAgent(id: string) {
     const live = manager.getAgent(id);
     const stored = await storage.get(id);
-    if (live)
-      return serializeAgentSnapshot(live, {
-        title: stored?.title,
-        archivedAt: stored?.archivedAt,
-      });
+    if (live) return snapshotAgent(live, stored);
     if (!stored) return null;
     return buildStoredAgentPayload(stored, manager.getRegisteredProviderIds(), (provider, own) => {
       return clients[provider]?.effectiveOptions?.(own) ?? own ?? {};
@@ -152,6 +168,15 @@ export async function openCentralAgents(
       beforeDispatch: async () => {
         requireActive(request);
         await beforeDispatch?.();
+        requireActive(request);
+        const { provisionalTitle } = resolveCreateAgentTitles({ initialPrompt: input.text });
+        if (provisionalTitle) {
+          const stored = await storage.get(agentId);
+          requireActive(request);
+          if (stored && !stored.title && !stored.lastUserMessageAt) {
+            await manager.setTitle(agentId, provisionalTitle);
+          }
+        }
         requireActive(request);
       },
     });
@@ -194,8 +219,12 @@ export async function openCentralAgents(
       metadata: input.metadata,
       env: input.env,
     });
-    await storage.applySnapshot(agent);
-    await onReady(serializeAgentSnapshot(agent));
+    const { provisionalTitle } = resolveCreateAgentTitles({
+      configTitle: input.config.title,
+      initialPrompt: input.initialPrompt,
+    });
+    await storage.applySnapshot(agent, { title: provisionalTitle });
+    await onReady(serializeAgentSnapshot(agent, { title: provisionalTitle }));
     if (hasPrompt) {
       await sendPrompt(
         agent.id,
@@ -357,6 +386,40 @@ export async function openCentralAgents(
     sendMessage,
     cancelAgent: (id: string) => cancelAgentRunCommand(dependencies, id),
     archiveAgent: (id: string) => archiveAgentCommand(dependencies, id),
+    async clearAgentAttention(ids: string[]) {
+      requireActive();
+      for (const id of ids) {
+        if (!manager.getAgent(id) && !(await storage.get(id))) {
+          throw new WorkerOperationError("agent_not_found");
+        }
+      }
+      requireActive();
+      await Promise.all(ids.map((id) => manager.clearAgentAttention(id)));
+    },
+    respondToPermission(
+      input: Extract<SessionInboundMessage, { type: "agent_permission_response" }>,
+    ) {
+      requireActive();
+      return respondToAgentPermission({ ...input, agentManager: manager, logger });
+    },
+    updateAgent: (input: Extract<SessionInboundMessage, { type: "update_agent_request" }>) =>
+      updateAgentCommand(dependencies, input),
+    createAgentConfigSession(emit: (message: SessionOutboundMessage) => void) {
+      return new AgentConfigSession({
+        host: { emit },
+        logger,
+        operations: {
+          ensureLoaded: async (agentId) => {
+            await ensureUnarchivedAgentLoaded(agentId, dependencies);
+          },
+          setMode: async (agentId, modeId) =>
+            (await setAgentModeCommand(dependencies, { agentId, modeId })).notice,
+          setModel: (agentId, modelId) => manager.setAgentModel(agentId, modelId),
+          setOptions: (agentId, patch) => manager.setAgentOptions(agentId, patch),
+          setThinking: (agentId, optionId) => manager.setAgentThinkingOption(agentId, optionId),
+        },
+      });
+    },
     async refreshAgent(agentId: string, request: AbortSignal) {
       requireActive(request);
       await unarchiveAgentState(storage, manager, agentId);
@@ -411,9 +474,10 @@ export async function openCentralAgents(
         requireActive();
         const agent = await ensureAgentLoaded(agentId, { ...dependencies, purpose: "history" });
         const page = manager.fetchTimeline(agentId, { direction, cursor, limit, wholeTurns });
+        const stored = await storage.get(agentId);
         return {
           ...reply,
-          agent: serializeAgentSnapshot(agent),
+          agent: snapshotAgent(agent, stored),
           epoch: page.epoch,
           window: page.window,
           reset: page.reset,

@@ -9,6 +9,7 @@ import pino from "pino";
 import { afterEach, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import { DaemonClient, type WebSocketLike } from "@getpaseo/client/internal/daemon-client";
+import { AgentStorage } from "../agent/agent-storage.js";
 import { acquirePidLock, getPidLockInfo, releasePidLock } from "../pid-lock.js";
 import {
   createNativeExecution,
@@ -62,11 +63,19 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     if (method === 'turn/start') count();
     if (method === 'thread/start' || method === 'thread/resume') fs.writeFileSync(process.env.FIXTURE_STATE + '/session-pid', String(process.pid));
     if (method === 'thread/resume') fs.appendFileSync(process.env.FIXTURE_STATE + '/resumes', 'resume\n');
-    const result = ({ initialize: { userAgent: 'fixture' }, 'model/list': { data: [{ id: 'fixture', model: 'fixture', isDefault: true, displayName: 'Fixture', description: 'fixture', hidden: false, supportedReasoningEfforts: [], defaultReasoningEffort: 'medium' }] }, 'thread/start': { thread: { id: 'shared-native-id' } }, 'thread/resume': { thread: { id: 'shared-native-id' } }, 'thread/read': { thread: { id: 'shared-native-id', turns: [{ id: 't1', status: 'interrupted', items: [{ id: 'rehydrated', type: 'userMessage', content: [{ type: 'text', text: 'provider history', text_elements: [] }] }] }] } }, 'turn/start': { turn: { id: 't1', status: 'inProgress' } } })[method] ?? {};
+    const result = ({ initialize: { userAgent: 'codex/0.121.0' }, 'model/list': { data: [{ id: 'fixture', model: 'fixture', isDefault: true, displayName: 'Fixture', description: 'fixture', hidden: false, supportedReasoningEfforts: [], defaultReasoningEffort: 'medium' }] }, 'thread/start': { thread: { id: 'shared-native-id' } }, 'thread/resume': { thread: { id: 'shared-native-id' } }, 'thread/read': { thread: { id: 'shared-native-id', turns: [{ id: 't1', status: 'interrupted', items: [{ id: 'rehydrated', type: 'userMessage', content: [{ type: 'text', text: 'provider history', text_elements: [] }] }] }] } }, 'turn/start': { turn: { id: 't1', status: 'inProgress' } } })[method] ?? {};
+    if (id === 8001) {
+      fs.writeFileSync(process.env.FIXTURE_STATE + '/permission-decision', command.result?.decision ?? 'missing');
+      send({ method: 'turn/completed', params: { threadId: 'shared-native-id', turn: { id: 't1', status: 'completed' } } });
+      return;
+    }
     send({ id, result });
     if (method === 'turn/start') {
       send({ method: 'turn/started', params: { threadId: 'shared-native-id', turn: { id: 't1', status: 'inProgress' } } });
-      if (!turnHeld()) setTimeout(() => send({ method: 'turn/completed', params: { threadId: 'shared-native-id', turn: { id: 't1', status: 'completed' } } }), 250);
+      if (fs.existsSync(process.env.FIXTURE_STATE + '/require-permission')) {
+        send({ jsonrpc: '2.0', id: 8001, method: 'item/commandExecution/requestApproval',
+          params: { itemId: 'fixture-command', threadId: 'shared-native-id', turnId: 't1', command: 'echo fixture', cwd: process.env.FIXTURE_STATE } });
+      } else if (!turnHeld()) setTimeout(() => send({ method: 'turn/completed', params: { threadId: 'shared-native-id', turn: { id: 't1', status: 'completed' } } }), 250);
     }
     if (method === 'turn/interrupt') {
       fs.appendFileSync(process.env.FIXTURE_STATE + '/interrupts', 'interrupt\n');
@@ -206,6 +215,7 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
   const restartFailures: string[] = [];
   const residents = new Map<string, Awaited<ReturnType<typeof startResidentExecution>>>();
   const targets = new Map<string, { password: string; target: WorkerTarget }>();
+  const untitledAgentId = randomUUID();
   for (const [label, provider] of [
     ["a", "codex"],
     ["b", "omp"],
@@ -245,6 +255,24 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
     );
     await writeFile(path.join(local, "server-id"), `srv_${label}\n`);
     await writeFile(path.join(local, "marker.txt"), `${label}-only`);
+    if (label === "a") {
+      const storage = new AgentStorage(path.join(local, "agents"), logger);
+      await storage.upsert({
+        id: untitledAgentId,
+        provider,
+        cwd: local,
+        workspaceId: "same-workspace",
+        createdAt: now,
+        updatedAt: now,
+        lastUserMessageAt: now,
+        lastStatus: "closed",
+        title: null,
+        labels: {},
+        metadata: {},
+        background: true,
+        persistence: { provider, sessionId: "shared-native-id" },
+      });
+    }
     const pluginDir = path.join(local, "fixture-plugin");
     await mkdir(pluginDir);
     await writeFile(
@@ -457,6 +485,13 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
     ["a"],
     ["b"],
   ]);
+  async function checkUntitledHistory() {
+    expect((await a.fetchAgent(untitledAgentId))?.agent.title).toBeNull();
+    const untitledHistory = await a.fetchAgentTimeline(untitledAgentId);
+    expect(untitledHistory.agent?.title).toBe("provider history");
+    expect((await a.fetchAgent(untitledAgentId))?.agent.title).toBe("provider history");
+  }
+  await checkUntitledHistory();
   const agentId = randomUUID();
   const start = (client: DaemonClient, label: string, provider: string) =>
     client.createAgent({
@@ -471,31 +506,83 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
     [agentId, "codex"],
     [agentId, "omp"],
   ]);
-  await expect.poll(() => observedIds).toContain(agentId);
-  const received: string[] = [];
-  const timeline = a.subscribeAgentTimeline(agentId, (message) => received.push(message.type));
-  await timeline.ready;
-  cleanups.push(() => timeline.release());
-  const send = (client: DaemonClient) =>
-    client.sendAgentMessage(agentId, "hello", { messageId: "same-message-key" });
-  expect(await Promise.allSettled([send(a), send(b)])).toEqual([
-    expect.objectContaining({ status: "fulfilled" }),
-    expect.objectContaining({ status: "fulfilled" }),
-  ]);
-  await send(a);
-  await expect.poll(() => received).toContain("agent_stream");
-  await timeline.release();
-  const reopened = openClient(central.port, "a.paseo.test", "password-a");
-  await reopened.connect();
-  const resumedTimeline = reopened.subscribeAgentTimeline(agentId, () => {});
-  cleanups.push(() => resumedTimeline.release());
-  await resumedTimeline.ready;
-  const history = await reopened.fetchAgentTimeline(agentId);
-  expect(history.entries).toEqual(
-    expect.arrayContaining([
-      expect.objectContaining({ item: expect.objectContaining({ type: "user_message" }) }),
-    ]),
-  );
+  async function checkSessionParity() {
+    await expect.poll(() => observedIds).toContain(agentId);
+    await a.setAgentModel(agentId, "fixture");
+    expect((await a.fetchAgent(agentId))?.agent.model).toBe("fixture");
+    expect((await b.fetchAgent(agentId))?.agent.model).not.toBe("fixture");
+    const received: string[] = [];
+    const timeline = a.subscribeAgentTimeline(agentId, (message) => received.push(message.type));
+    await timeline.ready;
+    cleanups.push(() => timeline.release());
+    const permissions = a.observeEvents(["agent_permission_request", "agent_permission_resolved"]);
+    cleanups.push(() => permissions.release());
+    const pending = Promise.withResolvers<string>();
+    const resolved = Promise.withResolvers<string>();
+    permissions.subscribe({
+      snapshot() {},
+      update(message) {
+        if (message.type === "agent_permission_request")
+          pending.resolve(message.payload.request.id);
+        if (message.type === "agent_permission_resolved")
+          resolved.resolve(message.payload.requestId);
+      },
+    });
+    await permissions.ready;
+    const requirePermission = path.join(root, "a", "require-permission");
+    await writeFile(requirePermission, "");
+    const send = (client: DaemonClient) =>
+      client.sendAgentMessage(agentId, "hello", { messageId: "same-message-key" });
+    expect(await Promise.allSettled([send(a), send(b)])).toEqual([
+      expect.objectContaining({ status: "fulfilled" }),
+      expect.objectContaining({ status: "fulfilled" }),
+    ]);
+    const permissionId = await pending.promise;
+    expect((await a.fetchAgent(agentId))?.agent.pendingPermissions.map(({ id }) => id)).toContain(
+      permissionId,
+    );
+    await a.respondToPermission(agentId, permissionId, { behavior: "allow" });
+    await expect
+      .poll(async () => readFile(path.join(root, "a", "permission-decision"), "utf8"))
+      .toBe("accept");
+    expect(await resolved.promise).toBe(permissionId);
+    await rm(requirePermission);
+    await send(a);
+    await expect.poll(() => received).toContain("agent_stream");
+    await timeline.release();
+    const reopened = openClient(central.port, "a.paseo.test", "password-a");
+    await reopened.connect();
+    const resumedTimeline = reopened.subscribeAgentTimeline(agentId, () => {});
+    cleanups.push(() => resumedTimeline.release());
+    await resumedTimeline.ready;
+    const history = await reopened.fetchAgentTimeline(agentId);
+    expect(history.agent?.title).toBe("hello");
+    await expect
+      .poll(async () => (await reopened.fetchAgent(agentId))?.agent.requiresAttention)
+      .toBe(true);
+    await expect
+      .poll(async () => (await b.fetchAgent(agentId))?.agent.requiresAttention)
+      .toBe(true);
+    await reopened.clearAgentAttention(agentId);
+    expect((await reopened.fetchAgent(agentId))?.agent.requiresAttention).toBe(false);
+    expect((await b.fetchAgent(agentId))?.agent.requiresAttention).toBe(true);
+    await reopened.updateAgent(agentId, { name: "Renamed session" });
+    expect((await reopened.fetchAgentTimeline(agentId)).agent?.title).toBe("Renamed session");
+    expect((await b.fetchAgent(agentId))?.agent.title).toBe("hello");
+    const matchingHistory = await reopened.fetchAgentHistory({
+      search: "Renamed session",
+      page: { limit: 1 },
+    });
+    expect(matchingHistory.entries.map(({ agent }) => agent.title)).toEqual(["Renamed session"]);
+    expect((await b.fetchAgentHistory({ search: "Renamed session" })).entries).toEqual([]);
+    expect(history.entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ item: expect.objectContaining({ type: "user_message" }) }),
+      ]),
+    );
+    return reopened;
+  }
+  const reopened = await checkSessionParity();
   for (const label of ["a", "b"])
     expect(await readFile(path.join(root, label, "prompts"), "utf8")).toBe("prompt\n");
   await a.cancelAgent(agentId);
@@ -504,6 +591,7 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
     const readOnly = openClient(central.port, "a.paseo.test", "password-a", ["workspace.read"]);
     await readOnly.connect();
     expect((await readOnly.fetchAgent(agentId))?.agent.id).toBe(agentId);
+    await expect(readOnly.clearAgentAttention(agentId)).rejects.toThrow("Permission denied");
     await expect(readOnly.archiveAgent(agentId)).rejects.toThrow("Permission denied");
     await expect(readOnly.refreshAgent(agentId)).rejects.toThrow("Permission denied");
     await expect(readOnly.restartServer()).rejects.toThrow("Permission denied");

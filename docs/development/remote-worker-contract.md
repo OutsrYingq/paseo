@@ -14,6 +14,10 @@ Renewal extends the same live grant. Authoritative principal revocation ends the
 
 The resident validates TLS and the exact worker ID, Pod UID, and server ID before opening an execution channel. Startup checks the server ID in the mounted volume. X25519 material stays with its original owner. Direct clients continue to verify the established server ID. This contract covers direct connections.
 
+Agent configuration requests apply to the connected worker's agent. Renaming and clearing an agent's attention marker require `workspace.write`. Agent lists and timeline snapshots prefer the stored title. When older sessions have no stored title, Central can derive a display title from the first user message in the loaded history.
+
+The history query searches and pages within the selected worker. Permission requests and resolutions reach subscribed clients in that worker's scope. Responding to a permission request requires `workspace.write`.
+
 ## Scoped refresh and restart
 
 `refresh_agent_request` requires `workspace.write`. It resolves the agent in the admitted worker's scope, reopens the native session, and loads its provider timeline. The existing per-agent lifecycle lane handles any active turn before reopening. A v0.17.4 refresh leaves the owning workspace's archive and recovery state alone.
