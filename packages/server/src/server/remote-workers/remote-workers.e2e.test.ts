@@ -457,6 +457,22 @@ it("imports and rewinds an OMP history through the public SDK", async () => {
     "second prompt",
   ]);
   expect(await readFile(sessionFile, "utf8")).toBe(archive);
+
+  const recentProject = path.join(cwd, "recent-project");
+  const nested = path.join(recentProject, "src");
+  await mkdir(nested, { recursive: true });
+  execFileSync("git", ["init", recentProject], { stdio: "pipe" });
+  const recentProjectId = randomUUID();
+  await writeFile(
+    path.join(cwd, "native-sessions", `test_${recentProjectId}.jsonl`),
+    JSON.stringify({ type: "session", version: 3, id: recentProjectId, timestamp, cwd: nested }),
+  );
+  expect((await client.listProjectSuggestions(recent)).suggestions).toMatchObject([
+    { rootPath: recentProject, displayName: "recent-project", sessionCount: 1, providerIds: ["omp"] },
+  ]);
+  expect((await other.listProjectSuggestions(recent)).suggestions).toEqual([]);
+  expect((await client.addProject(recentProject)).project?.projectRootPath).toBe(recentProject);
+  expect((await client.listProjectSuggestions(recent)).suggestions).toEqual([]);
 }, 30_000);
 
 it("uses the unchanged SDK against two mTLS residents and isolated native and download paths", async () => {

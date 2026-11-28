@@ -1020,6 +1020,7 @@ export async function startRemoteCentral(options: CentralOptions) {
             agentForkContextCursor: true,
             ...(scope.connection.supportsWorkspaceOperations && {
               diffSubscription: true,
+              projectSuggestions: true,
               workspaceSetupObservation: true,
               workspaceSetupRun: true,
               workspaceRecovery: true,

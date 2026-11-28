@@ -34,6 +34,7 @@ import {
   changeProjectDirectory,
   inspectResidentProject,
   resolveProjectParent,
+  resolveResidentProjectSuggestion,
 } from "./resident-projects.js";
 import { openResidentCheckoutQueries } from "./resident-checkout.js";
 import { openResidentState } from "./resident-state.js";
@@ -496,6 +497,12 @@ export function createNativeExecution(options: NativeExecutionOptions) {
               paseoHome: options.paseoHome,
               serverId: binding.serverId,
             });
+          case "projectSuggestionRoot":
+            return resolveResidentProjectSuggestion(
+              options.workspaceRoots ?? [],
+              operation.cwd,
+              options.paseoHome,
+            );
           case "projectDirectoryParent":
             return resolveProjectParent(options.workspaceRoots ?? [], operation.parentPath);
           case "projectDirectoryChange":

@@ -1,4 +1,5 @@
 import { mkdir, realpath, rmdir, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import { expandTilde } from "../../utils/path.js";
 import { getCheckoutIdentity } from "../../utils/checkout-git.js";
@@ -47,6 +48,27 @@ export async function changeProjectDirectory(
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code) throw new WorkerOperationError(code);
+    throw error;
+  }
+}
+
+export async function resolveResidentProjectSuggestion(
+  roots: readonly string[],
+  cwd: string,
+  paseoHome: string,
+): Promise<string | null> {
+  if (!path.isAbsolute(cwd)) return null;
+  try {
+    const directory = await resolveProjectParent(roots, cwd);
+    const checkout = await getCheckoutIdentity(directory, { paseoHome });
+    const candidate = checkout.isGit ? checkout.mainRepoRoot ?? checkout.repoRoot ?? directory : directory;
+    const root = candidate === directory ? directory : await resolveProjectParent(roots, candidate);
+    return root === homedir() || root === path.parse(root).root ? null : root;
+  } catch (error) {
+    if (
+      error instanceof WorkerOperationError &&
+      ["ENOENT", "ENOTDIR", "worker_workspace_root_denied"].includes(error.message)
+    ) return null;
     throw error;
   }
 }

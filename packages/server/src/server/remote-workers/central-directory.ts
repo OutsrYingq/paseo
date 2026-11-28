@@ -17,6 +17,7 @@ import { matchesAgentHistoryQuery } from "../agent-history-search.js";
 import { WorkspaceDirectory } from "../workspace-directory.js";
 import { describeProject } from "../project-descriptor.js";
 import { registerProjectDirectory } from "../project-registration.js";
+import { listProjectSuggestions, ProjectSuggestionsRequestError } from "../project-suggestions.js";
 import { createProjectDirectory, ProjectDirectoryRequestError } from "../project-directory-service.js";
 import { generateWorkspaceId, initialWorkspacePlacement } from "../workspace-registry-model.js";
 import { areEquivalentPaths } from "../../utils/path.js";
@@ -103,10 +104,36 @@ export function createCentralDirectory(
     logger,
   });
   function dispatchProject(message: SessionInboundMessage): Promise<SessionOutboundMessage> | undefined {
+    if (message.type === "project.suggestions.request") return suggestProjects(message);
     if (message.type === "workspace.github.search_repositories.request")
       return connection.call({ kind: "projectGithubSearch", request: message });
     if (message.type === "project.github.clone.request") return cloneGithubProject(message);
     return projectManagement.dispatch(message);
+  }
+
+  async function suggestProjects(
+    request: Extract<SessionInboundMessage, { type: "project.suggestions.request" }>,
+  ): Promise<SessionOutboundMessage> {
+    try {
+      const result = await listProjectSuggestions({
+        request,
+        agentManager: agents.manager,
+        projectRegistry,
+        resolveRemoteRoot: (cwd) => connection.call({ kind: "projectSuggestionRoot", cwd }),
+      });
+      return { type: "project.suggestions.response", payload: { requestId: request.requestId, ...result } };
+    } catch (error) {
+      logger.error({ err: error }, "Failed to handle project.suggestions.request");
+      return {
+        type: "rpc_error",
+        payload: {
+          requestId: request.requestId,
+          requestType: request.type,
+          error: getErrorMessage(error),
+          code: error instanceof ProjectSuggestionsRequestError ? error.code : "project_suggestions_failed",
+        },
+      };
+    }
   }
 
   async function cloneGithubProject(

@@ -1,13 +1,17 @@
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, parse, resolve } from "node:path";
+import { basename, parse, resolve, win32 } from "node:path";
 import pLimit from "p-limit";
 import type { ProjectSuggestion, ProjectSuggestionsRequest } from "@getpaseo/protocol/messages";
 import type { AgentManager, ManagedImportableProviderSession } from "./agent/agent-manager.js";
 import { isMetadataGenerationSession } from "./agent/import-sessions.js";
 import type { WorkspaceGitService } from "./workspace-git-service.js";
 import type { ProjectRegistry } from "./workspace-registry.js";
-import { normalizePathForIdentity } from "../utils/path.js";
+import {
+  looksLikeDefiniteWindowsPath,
+  normalizePathForComparison,
+  normalizePathForIdentity,
+} from "../utils/path.js";
 
 const DEFAULT_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_LIMIT = 20;
@@ -25,13 +29,15 @@ export class ProjectSuggestionsRequestError extends Error {
   }
 }
 
-export interface ListProjectSuggestionsInput {
+export type ListProjectSuggestionsInput = {
   request: Pick<ProjectSuggestionsRequest, "providers" | "since" | "limit">;
   agentManager: Pick<AgentManager, "listImportableSessions">;
   projectRegistry: Pick<ProjectRegistry, "list">;
-  workspaceGitService: Pick<WorkspaceGitService, "getCheckout">;
   now?: Date;
-}
+} & (
+  | { workspaceGitService: Pick<WorkspaceGitService, "getCheckout">; resolveRemoteRoot?: never }
+  | { workspaceGitService?: never; resolveRemoteRoot(cwd: string): Promise<string | null> }
+);
 
 export interface ListProjectSuggestionsResult {
   suggestions: ProjectSuggestion[];
@@ -57,18 +63,29 @@ export async function listProjectSuggestions(
     (session) => session.lastActivityAt.getTime() >= since && !isMetadataGenerationSession(session),
   );
 
+  const cwdKey = input.resolveRemoteRoot ? (cwd: string) => cwd : resolve;
+  const pathKey = input.resolveRemoteRoot ? remotePathKey : normalizePathForIdentity;
+  const git = input.workspaceGitService;
+  const lookup = git ? (cwd: string) => resolveProjectRoot(cwd, git) : input.resolveRemoteRoot;
   const rootByCwd = await resolveProjectRoots(
-    new Set(sessions.map((session) => resolve(session.cwd))),
-    input.workspaceGitService,
+    new Set(sessions.map((session) => cwdKey(session.cwd))),
+    lookup,
   );
-  const excludedRoots = await collectExcludedRoots(input.projectRegistry);
+  const projects = await input.projectRegistry.list();
+  const excludedRoots = new Set(
+    projects.filter((project) => !project.archivedAt).map((project) => pathKey(project.rootPath)),
+  );
+  if (!input.resolveRemoteRoot) {
+    const home = homedir();
+    excludedRoots.add(pathKey(home));
+    excludedRoots.add(pathKey(parse(home).root));
+  }
   const groups = new Map<string, SuggestionGroup>();
   for (const session of sessions) {
-    const rootPath = rootByCwd.get(resolve(session.cwd));
-    if (!rootPath || excludedRoots.has(normalizePathForIdentity(rootPath))) {
-      continue;
-    }
-    addSession(groups, rootPath, session);
+    const rootPath = rootByCwd.get(cwdKey(session.cwd));
+    if (!rootPath) continue;
+    const key = pathKey(rootPath);
+    if (!excludedRoots.has(key)) addSession(groups, key, rootPath, session);
   }
 
   const suggestions = Array.from(groups.values())
@@ -99,12 +116,12 @@ function parseSince(since: string | undefined, now: Date): number {
 /** Maps each session cwd to the folder a project would be added at, or null when it is gone. */
 async function resolveProjectRoots(
   cwds: Set<string>,
-  workspaceGitService: Pick<WorkspaceGitService, "getCheckout">,
+  lookup: (cwd: string) => Promise<string | null>,
 ): Promise<Map<string, string | null>> {
   const limit = pLimit(CHECKOUT_READ_CONCURRENCY);
   const entries = await Promise.all(
     Array.from(cwds, (cwd) =>
-      limit(async () => [cwd, await resolveProjectRoot(cwd, workspaceGitService)] as const),
+      limit(async () => [cwd, await lookup(cwd)] as const),
     ),
   );
   return new Map(entries);
@@ -126,26 +143,16 @@ async function resolveProjectRoot(
   return rootPath;
 }
 
-/** Active projects are already added; the home directory and filesystem root are not projects. */
-async function collectExcludedRoots(
-  projectRegistry: Pick<ProjectRegistry, "list">,
-): Promise<Set<string>> {
-  const home = homedir();
-  const excluded = new Set([home, parse(home).root].map(normalizePathForIdentity));
-  for (const project of await projectRegistry.list()) {
-    if (!project.archivedAt) {
-      excluded.add(normalizePathForIdentity(project.rootPath));
-    }
-  }
-  return excluded;
+function remotePathKey(path: string): string {
+  return normalizePathForComparison(path, looksLikeDefiniteWindowsPath(path));
 }
 
 function addSession(
   groups: Map<string, SuggestionGroup>,
+  key: string,
   rootPath: string,
   session: ManagedImportableProviderSession,
 ): void {
-  const key = normalizePathForIdentity(rootPath);
   const group = groups.get(key) ?? {
     rootPath,
     sessionCount: 0,
@@ -159,9 +166,12 @@ function addSession(
 }
 
 function toSuggestion(group: SuggestionGroup): ProjectSuggestion {
+  const rootLabel = looksLikeDefiniteWindowsPath(group.rootPath)
+    ? win32.basename(group.rootPath)
+    : basename(group.rootPath);
   return {
     rootPath: group.rootPath,
-    displayName: basename(group.rootPath) || group.rootPath,
+    displayName: rootLabel || group.rootPath,
     sessionCount: group.sessionCount,
     providerIds: Array.from(group.providerIds).sort(),
     lastActivityAt: new Date(group.lastActivityAt).toISOString(),
