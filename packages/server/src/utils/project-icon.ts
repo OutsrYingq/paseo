@@ -1,5 +1,5 @@
-import { readdir, readFile, stat } from "fs/promises";
-import { extname, join } from "path";
+import { readdir, readFile, realpath, stat } from "fs/promises";
+import { extname, isAbsolute, join, relative, sep } from "path";
 
 /**
  * Icon file patterns to search for, in priority order.
@@ -495,19 +495,29 @@ async function findDirRecursively(
  * @param projectDir - The root directory of the project to search
  * @returns The icon data with mime type, or null if not found
  */
-export async function getProjectIcon(projectDir: string): Promise<ProjectIcon | null> {
+export async function getProjectIcon(
+  projectDir: string,
+  options?: { confineToProject?: boolean },
+): Promise<ProjectIcon | null> {
   const iconPath = await findProjectIcon(projectDir);
   if (!iconPath) {
     return null;
   }
 
   try {
-    const stats = await stat(iconPath);
+    const file = options?.confineToProject ? await realpath(iconPath) : iconPath;
+    if (options?.confineToProject) {
+      const relativePath = relative(await realpath(projectDir), file);
+      if (isAbsolute(relativePath) || relativePath === ".." || relativePath.startsWith(`..${sep}`)) {
+        return null;
+      }
+    }
+    const stats = await stat(file);
     if (stats.size > MAX_ICON_SIZE) {
       return null;
     }
 
-    const fileBuffer = await readFile(iconPath);
+    const fileBuffer = await readFile(file);
     let mimeType = sniffMimeType(fileBuffer) ?? getMimeType(iconPath);
     let buffer: Buffer = fileBuffer;
     if (mimeType === "image/x-icon") {

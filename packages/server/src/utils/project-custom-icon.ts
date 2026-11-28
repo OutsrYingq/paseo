@@ -23,7 +23,7 @@ export async function setProjectCustomIcon(input: {
   paseoHome: string;
   projectId: string;
   source: ProjectIconSource;
-  projects: ProjectRegistry;
+  projects: Pick<ProjectRegistry, "get" | "update">;
 }): Promise<PersistedProjectRecord> {
   return serialize(input.projectId, async () => {
     if (!(await input.projects.get(input.projectId))) throw new Error("Project not found");
@@ -86,6 +86,7 @@ export class ProjectIconReader {
 export async function readProjectIconSnapshot(input: {
   paseoHome: string;
   project: PersistedProjectRecord;
+  confineToProject?: boolean;
 }): Promise<ProjectIconSnapshot> {
   if (input.project.customIconRevision) {
     let icon: ProjectIcon | null = null;
@@ -102,7 +103,7 @@ export async function readProjectIconSnapshot(input: {
         : `custom:none:${input.project.customIconRevision}`,
     };
   }
-  const icon = await getProjectIcon(input.project.rootPath);
+  const icon = await getProjectIcon(input.project.rootPath, { confineToProject: input.confineToProject });
   if (!icon) return { icon: null, revision: "automatic:none:v1" };
   return { icon, revision: iconRevision("automatic", icon) };
 }

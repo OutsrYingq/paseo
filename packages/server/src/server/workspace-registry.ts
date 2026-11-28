@@ -428,6 +428,7 @@ export class FileBackedProjectRegistry
     logger: Logger,
     options?: {
       projectIdFactory?: () => string;
+      readRecords?: (filePath: string) => Promise<string | null>;
       writeRecords?: (
         filePath: string,
         records: readonly PersistedProjectRecord[],
@@ -440,6 +441,7 @@ export class FileBackedProjectRegistry
       schema: PersistedProjectRecordSchema,
       getId: (record) => record.projectId,
       component: "projects",
+      readRecords: options?.readRecords,
       writeRecords: options?.writeRecords,
     });
     this.projectIdFactory = options?.projectIdFactory ?? generateProjectId;
