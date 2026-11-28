@@ -37,6 +37,7 @@ Central authorizes public requests and binds subscriptions to their client socke
 - Usage reports and legacy provider usage come from the resident's usage-source registry. Provider launch environments and credentials stay on that resident. Central streams the report entries to the requesting client.
 - Chat search and the prompt index use the same timeline queries as standalone, against the admitted worker's agent history.
 - Provider subagent timelines and background work use the same handlers as standalone. Central projects updates for each authorized subscription.
+- Dictation runs the stock stream manager and configured speech provider on the resident. The execution handshake negotiates dictation separately, and the Central socket that started the recording owns its events and cleanup.
 
 ## Scoped refresh and restart
 

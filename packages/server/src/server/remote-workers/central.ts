@@ -72,6 +72,7 @@ import {
   handleWorkspaceLabelRequest,
   isWorkspaceLabelRequest,
 } from "../session/workspace-labels/label-session.js";
+import type { RemoteDictationEvent } from "./remote-dictation-protocol.js";
 type HostSettingsEvent = Extract<SessionOutboundMessage, { type: "status" }>;
 
 export interface CentralOptions {
@@ -102,7 +103,7 @@ type TimelineSubscriptions = Map<string, ReadonlySet<string>>;
 type ScriptStatusEvent = Extract<WorkerEvent, { type: "scriptStatus" }>;
 type Delivery = (
   event: CentralTimelineUpdate | CentralOrchestrationEvent | ScriptStatusEvent |
-    HostSettingsEvent | typeof connectionLostEvent,
+    HostSettingsEvent | RemoteDictationEvent | typeof connectionLostEvent,
 ) => void;
 
 export async function startRemoteCentral(options: CentralOptions) {
@@ -166,7 +167,7 @@ export async function startRemoteCentral(options: CentralOptions) {
       else if (event.type === "diffFrame" || event.type === "legacyDiffSnapshot") {
         diffSubscriptions.deliver(event);
       }
-      else if (event.type === "scriptStatus") {
+      else if (event.type === "scriptStatus" || event.type === "dictationReadiness" || event.type === "dictationOutput") {
         for (const deliver of audiences.get(execution) ?? []) deliver(event);
       }
       else if (event.type === "worktreeSetup") {
@@ -459,6 +460,11 @@ export async function startRemoteCentral(options: CentralOptions) {
       const sendAuthorized = (outbound: SessionOutboundMessage) => {
         if (!lease.signal.aborted && authorization.allowsOutbound(outbound)) sendSession(outbound);
       };
+      const dictationEnabled =
+        scope.connection.supportsDictation && authorization.allowsPermission("workspace.write");
+      let dictationSource: string | undefined;
+      let dictationReadiness: { enabled: boolean; reason: string } | undefined;
+      let serverInfoSent = false;
       const socketLifetime = new AbortController();
       let focusedAgentId: string | null = null;
       const sendBinary = (bytes: Uint8Array): Promise<void> => {
@@ -674,6 +680,17 @@ export async function startRemoteCentral(options: CentralOptions) {
       const deliver: Delivery = (event) => {
         if (event === connectionLostEvent) return socket.close(1013, "Worker connection lost");
         if (lease.signal.aborted) return;
+        if (event.type === "dictationReadiness") {
+          if (dictationEnabled) {
+            dictationReadiness = event.state;
+            if (serverInfoSent) sendServerInfo();
+          }
+          return;
+        }
+        if (event.type === "dictationOutput") {
+          if (event.source === dictationSource) sendAuthorized(event.message);
+          return;
+        }
         if (event.type === "status") {
           sendAuthorized(event);
           return;
@@ -758,6 +775,11 @@ export async function startRemoteCentral(options: CentralOptions) {
         );
         pluginSession.close();
         lease.signal.removeEventListener("abort", detached);
+        if (dictationSource && !scope.connection.signal.aborted) {
+          void scope.connection.call({ kind: "dictationClose", source: dictationSource }).catch((err) => {
+            options.logger.warn({ err }, "Failed to close remote dictation");
+          });
+        }
         audience.delete(deliver);
         if (audience.size === 0) audiences.delete(lease.execution);
       };
@@ -879,6 +901,29 @@ export async function startRemoteCentral(options: CentralOptions) {
                 code: "permission_denied",
               },
             });
+          return;
+        }
+        if (
+          operation.type === "dictation_stream_start" ||
+          operation.type === "dictation_stream_chunk" ||
+          operation.type === "dictation_stream_finish" ||
+          operation.type === "dictation_stream_cancel"
+        ) {
+          try {
+            if (!dictationEnabled) throw new WorkerOperationError("Dictation unavailable");
+            if (socketLifetime.signal.aborted) return;
+            dictationSource ??= randomUUID();
+            await scope.connection.call({
+              kind: "dictationInput",
+              source: dictationSource,
+              message: operation,
+            });
+          } catch {
+            sendAuthorized({
+              type: "dictation_stream_error",
+              payload: { dictationId: operation.dictationId, error: "Dictation unavailable", retryable: false },
+            });
+          }
           return;
         }
         if (operation.type === "file.upload.request") return transfers.beginUpload(operation);
@@ -1074,7 +1119,7 @@ export async function startRemoteCentral(options: CentralOptions) {
           }
         }
       };
-      sendSession({
+      const serverInfo: HostSettingsEvent = {
         type: "status",
         payload: {
           status: "server_info",
@@ -1136,7 +1181,28 @@ export async function startRemoteCentral(options: CentralOptions) {
             timelineFreshnessCheck: true,
           },
         },
-      });
+      };
+      function sendServerInfo() {
+        const capabilities = dictationReadiness && {
+          voice: {
+            dictation: dictationReadiness,
+            voice: { enabled: false, reason: "Voice mode unavailable" },
+          },
+        };
+        sendSession({ ...serverInfo, payload: { ...serverInfo.payload, capabilities } });
+      }
+      if (dictationEnabled) {
+        try {
+          const state = await scope.connection.call({ kind: "dictationReadiness" });
+          dictationReadiness ??= state;
+        } catch (err) {
+          options.logger.warn({ err }, "Worker dictation readiness unavailable");
+        }
+      }
+      if (!socketLifetime.signal.aborted) {
+        sendServerInfo();
+        serverInfoSent = true;
+      }
     }
   }
 

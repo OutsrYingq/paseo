@@ -50,6 +50,11 @@ import { RemoteHostSettingsOperationSchema, remoteHostSettingsResults } from "./
 import { ProjectConfigOperationSchema, projectConfigResults } from "./remote-project-config-protocol.js";
 import { RemoteProjectGithubOperationSchema, remoteProjectGithubResults } from "./remote-project-github-protocol.js";
 import { RemoteProjectIconOperationSchema, remoteProjectIconResults } from "./remote-project-icon-protocol.js";
+import {
+  RemoteDictationEvents,
+  RemoteDictationOperations,
+  remoteDictationResults,
+} from "./remote-dictation-protocol.js";
 
 export const EXECUTION_PROTOCOL = "paseo.worker.v1";
 export const EXECUTION_PATH = "/execute";
@@ -102,6 +107,7 @@ export const WorkerOperationSchema = z.discriminatedUnion("kind", [
   ...ProjectConfigOperationSchema.options,
   ...RemoteProjectGithubOperationSchema.options,
   ...RemoteProjectIconOperationSchema.options,
+  ...RemoteDictationOperations,
   z.strictObject({
     kind: z.literal("explore"),
     ...fileTarget,
@@ -185,6 +191,7 @@ const WorkerEventSchema = z.discriminatedUnion("type", [
   ...RemoteDiffEventSchema.options,
   RemoteScriptEventSchema,
   RemoteWorktreeSetupEventSchema,
+  ...RemoteDictationEvents,
   z.strictObject({ type: z.literal("fileVersion"), id: z.uuid(), version: FileVersionSchema }),
   z.strictObject({
     type: z.literal("output"),
@@ -206,6 +213,7 @@ export const ExecutionResponseSchema = z.discriminatedUnion("kind", [
     binding: WorkerBindingSchema,
     restartRuntime: z.literal(true).optional(),
     workspaceOperations: z.literal(true).optional(),
+    dictation: z.literal(true).optional(),
   }),
   z.strictObject({
     kind: z.literal("result"),
@@ -255,6 +263,7 @@ export const operationResults = {
   ...projectConfigResults,
   ...remoteProjectGithubResults,
   ...remoteProjectIconResults,
+  ...remoteDictationResults,
   ...remoteTerminalOperationResults,
   plugin: RemotePluginResultSchema,
   restartRuntime: z.null(),

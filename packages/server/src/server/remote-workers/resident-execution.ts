@@ -27,11 +27,13 @@ import {
   type WorkerOperation,
 } from "./execution-protocol.js";
 import { WorkerBindingSchema, sameWorkerBinding, type WorkerBinding } from "./leases.js";
+import { DICTATION_HEADER, DICTATION_VERSION } from "./remote-dictation-protocol.js";
 
 export interface ResidentRuntime {
   execute(operation: Exclude<WorkerOperation, { kind: "restartRuntime" }>): Promise<unknown>;
   restartRuntime?(keepTerminals: boolean): Promise<void>;
   workspaceOperations?: true;
+  dictation?: true;
   close(): Promise<void>;
 }
 
@@ -104,6 +106,7 @@ export async function startResidentExecution(options: ResidentExecutionOptions) 
         options,
         request.headers[EXECUTION_FEATURES_HEADER] === RUNTIME_RESTART_FEATURE,
         request.headers[WORKSPACE_OPERATIONS_HEADER] === WORKSPACE_OPERATIONS_VERSION,
+        request.headers[DICTATION_HEADER] === DICTATION_VERSION,
       )
         .catch((error: unknown) => {
           // Stay fenced until the host stops this resident, even if no client is connected.
@@ -164,6 +167,7 @@ async function handleChannel(
   options: ResidentExecutionOptions,
   negotiateRestart: boolean,
   negotiateWorkspaceOperations: boolean,
+  negotiateDictation: boolean,
 ): Promise<void> {
   const lifetime = new AbortController();
   const inflight = new Map<string, Promise<void>>();
@@ -224,6 +228,7 @@ async function handleChannel(
             ...(negotiateWorkspaceOperations && opened.workspaceOperations
               ? { workspaceOperations: true }
               : {}),
+            ...(negotiateDictation && opened.dictation ? { dictation: true } : {}),
           });
         },
         () => socket.terminate(),

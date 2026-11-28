@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import { X509Certificate, randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { request } from "node:http";
+import { createServer, request } from "node:http";
 import { createConnection } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -252,6 +252,17 @@ it("imports and rewinds an OMP history through the public SDK", async () => {
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const script = path.join(root, "fixture.cjs");
   await writeFile(script, nativeFixture);
+  const transcriber = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ text: "Resident transcript" }));
+    });
+  });
+  await new Promise<void>((resolve) => transcriber.listen(0, "127.0.0.1", resolve));
+  cleanups.push(() => new Promise<void>((resolve) => transcriber.close(() => resolve())));
+  const speechAddress = transcriber.address();
+  if (!speechAddress || typeof speechAddress === "string") throw new Error("Missing speech fixture address");
   const timestamp = new Date().toISOString();
   const workspaceId = "same-workspace";
   const projectId = "same-project";
@@ -261,6 +272,19 @@ it("imports and rewinds an OMP history through the public SDK", async () => {
     const sessions = path.join(local, "native-sessions");
     await mkdir(path.join(local, "projects"), { recursive: true });
     await mkdir(sessions);
+    await writeFile(
+      path.join(local, "config.json"),
+      JSON.stringify({
+        features: {
+          dictation: label === "owner"
+            ? {
+                enabled: true,
+                stt: { provider: "openai", baseUrl: `http://127.0.0.1:${speechAddress.port}/v1`, apiKey: "<fixture>" },
+              }
+            : { enabled: false },
+        },
+      }),
+    );
     const record = { projectId, createdAt: timestamp, updatedAt: timestamp, archivedAt: null };
     await writeFile(
       path.join(local, "projects", "projects.json"),
@@ -336,6 +360,15 @@ it("imports and rewinds an OMP history through the public SDK", async () => {
   const client = openClient(central.port, "owner.paseo.test", "owner");
   const other = openClient(central.port, "other.paseo.test", "other");
   await Promise.all([client.connect(), other.connect()]);
+  const audioFormat = "audio/pcm;rate=16000;bits=16";
+  await client.startDictationStream("same-dictation", audioFormat);
+  await expect(other.startDictationStream("same-dictation", audioFormat)).rejects.toThrow();
+  const pcm = Buffer.alloc(32_000);
+  for (let i = 0; i < pcm.length; i += 2) pcm.writeInt16LE(4000 * Math.sin(i / 16), i);
+  client.sendDictationStreamChunk("same-dictation", 0, pcm.toString("base64"), audioFormat);
+  await expect(client.finishDictationStream("same-dictation", 0)).resolves.toMatchObject({
+    text: "Resident transcript",
+  });
 
   const cwd = path.join(root, "owner");
   const id = randomUUID();

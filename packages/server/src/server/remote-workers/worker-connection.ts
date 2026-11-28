@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { DICTATION_HEADER, DICTATION_VERSION } from "./remote-dictation-protocol.js";
 import { Agent as HttpsAgent } from "node:https";
 import { checkServerIdentity, type ConnectionOptions, type PeerCertificate } from "node:tls";
 import { WebSocket } from "ws";
@@ -50,6 +51,11 @@ export class WorkerConnection {
   readonly signal = this.lifetime.signal;
   private runtimeRestart = false;
   private workspaceOperations = false;
+  private dictation = false;
+
+  get supportsDictation() {
+    return this.dictation;
+  }
 
   get supportsWorkspaceOperations() {
     return this.workspaceOperations;
@@ -86,6 +92,7 @@ export class WorkerConnection {
       headers: {
         [EXECUTION_FEATURES_HEADER]: RUNTIME_RESTART_FEATURE,
         [WORKSPACE_OPERATIONS_HEADER]: WORKSPACE_OPERATIONS_VERSION,
+        [DICTATION_HEADER]: DICTATION_VERSION,
       },
       followRedirects: false,
       handshakeTimeout: 5_000,
@@ -120,6 +127,7 @@ export class WorkerConnection {
             return this.close();
           this.runtimeRestart = message.restartRuntime === true;
           this.workspaceOperations = message.workspaceOperations === true;
+          this.dictation = message.dictation === true;
           bound = true;
           clearTimeout(timer);
           resolve();

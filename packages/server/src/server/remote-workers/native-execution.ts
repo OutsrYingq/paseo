@@ -57,6 +57,10 @@ import { createResidentHostSettings } from "./resident-host-settings.js";
 import { executeResidentProjectConfig } from "./resident-project-config.js";
 import { cloneResidentGithubProject, searchResidentGithubRepositories } from "./resident-project-github.js";
 import { executeResidentProjectIcon } from "./resident-project-icons.js";
+import { loadPersistedConfig } from "../persisted-config.js";
+import { resolveSpeechConfig } from "../speech/speech-config-resolver.js";
+import { createSpeechService, type SpeechService } from "../speech/speech-runtime.js";
+import { openResidentDictation } from "./resident-dictation.js";
 
 interface OwnedProcess {
   child: ChildProcessWithoutNullStreams;
@@ -100,6 +104,23 @@ export function createNativeExecution(options: NativeExecutionOptions) {
     listNativeProviders,
   });
   let hostSettings = makeHostSettings();
+  let speech: SpeechService | undefined;
+  function readSpeechConfig() {
+    const resolved = resolveSpeechConfig({
+      paseoHome: options.paseoHome,
+      env: { ...process.env, PASEO_VOICE_MODE_ENABLED: "false" },
+      persisted: loadPersistedConfig(options.paseoHome, logger),
+    });
+    return { openaiConfig: resolved.openai, speechConfig: resolved.speech };
+  }
+  function getSpeech() {
+    if (!speech) {
+      speech = createSpeechService({ logger, ...readSpeechConfig() });
+      void speech.ready.catch(() => {});
+      speech.start();
+    }
+    return speech;
+  }
   async function listNativeProviders() {
     const available: Array<"codex" | "omp"> = [];
     if (providers.codex && (await resolveCodexLaunchPrefix(providers.codex).catch(() => null)))
@@ -157,6 +178,7 @@ export function createNativeExecution(options: NativeExecutionOptions) {
       resolveOmpSessionsDir({ runtimeSettings: providers.omp }),
     );
     const owner = Symbol("worker link");
+    const dictation = openResidentDictation(getSpeech, publish, logger);
     const setupRuntime = new WorkspaceSetupRuntime();
     const runningSetup = new Set<string>();
     const stopSetup = () => Promise.all([...runningSetup].map((id) => setupRuntime.stop(id)));
@@ -454,18 +476,27 @@ export function createNativeExecution(options: NativeExecutionOptions) {
 
     return Promise.resolve({
       workspaceOperations: true,
+      dictation: true,
       async execute(operation) {
         signal.throwIfAborted();
         if ("processId" in operation) return executeProcess(operation);
         switch (operation.kind) {
           case "plugin":
             return executePlugin(operation);
+          case "hostSettingsReload": {
+            const result = await hostSettings.execute(operation);
+            if (speech) speech.reconfigure(readSpeechConfig());
+            return result;
+          }
           case "hostSettingsGet":
           case "hostSettingsPatch":
-          case "hostSettingsReload":
           case "hostStatus":
           case "hostDiagnostics":
             return hostSettings.execute(operation);
+          case "dictationReadiness":
+          case "dictationInput":
+          case "dictationClose":
+            return dictation.execute(operation);
           case "workspaceRefs": {
             return (await listWorkspaces())
               .filter((workspace) => !workspace.archivedAt)
@@ -616,6 +647,9 @@ export function createNativeExecution(options: NativeExecutionOptions) {
         }
       },
       async restartRuntime(keepTerminals) {
+        dictation.close();
+        await speech?.stop();
+        speech = undefined;
         terminalChannel.dispose();
         scriptChannel.close();
         await transfers.close();
@@ -624,6 +658,7 @@ export function createNativeExecution(options: NativeExecutionOptions) {
         hostSettings = makeHostSettings();
       },
       async close() {
+        dictation.close();
         terminalChannel.dispose();
         scriptChannel.close();
         await plugins?.close();
@@ -642,7 +677,7 @@ export function createNativeExecution(options: NativeExecutionOptions) {
   async function close() {
     stopped = true;
     await scripts.dispose();
-    await Promise.all([terminals.dispose(), stopRuntime()]);
+    await Promise.all([terminals.dispose(), stopRuntime(), speech?.stop()]);
   }
   return { openRuntime, close };
 }
