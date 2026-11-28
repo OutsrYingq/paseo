@@ -230,7 +230,7 @@ describe("CheckoutSession", () => {
         git: { getSnapshot: async () => createGitSnapshot("/repo", "main") },
       });
 
-      await checkout.handleStatusRequest({
+      await checkout.queries.handleStatusRequest({
         type: "checkout_status_request",
         cwd: "/repo",
         requestId: "r1",
@@ -258,7 +258,7 @@ describe("CheckoutSession", () => {
         },
       });
 
-      await checkout.handleStatusRequest({
+      await checkout.queries.handleStatusRequest({
         type: "checkout_status_request",
         cwd: "/repo",
         requestId: "r2",
@@ -284,7 +284,7 @@ describe("CheckoutSession", () => {
         git: { validateBranchRef: async () => ({ kind: "local", name: "feature" }) },
       });
 
-      await checkout.handleValidateBranchRequest({
+      await checkout.queries.handleValidateBranchRequest({
         type: "validate_branch_request",
         cwd: "/repo",
         branchName: "feature",
@@ -310,7 +310,7 @@ describe("CheckoutSession", () => {
         git: { validateBranchRef: async () => ({ kind: "not-found" }) },
       });
 
-      await checkout.handleValidateBranchRequest({
+      await checkout.queries.handleValidateBranchRequest({
         type: "validate_branch_request",
         cwd: "/repo",
         branchName: "ghost",
@@ -342,7 +342,7 @@ describe("CheckoutSession", () => {
         },
       });
 
-      await checkout.handleValidateBranchRequest({
+      await checkout.queries.handleValidateBranchRequest({
         type: "validate_branch_request",
         cwd: "/repo",
         branchName: "bad ref!",
@@ -376,7 +376,7 @@ describe("CheckoutSession", () => {
         },
       });
 
-      await checkout.handleBranchSuggestionsRequest({
+      await checkout.queries.handleBranchSuggestionsRequest({
         type: "branch_suggestions_request",
         cwd: "/repo",
         requestId: "r6",

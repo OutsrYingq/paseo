@@ -3462,27 +3462,15 @@ export class Session {
 
   // eslint-disable-next-line complexity
   private dispatchCheckoutMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    const query = this.checkoutSession.queries.dispatch(msg, this.delivery.requestSignal);
+    if (query) return query;
     switch (msg.type) {
       case "diff.subscribe.request":
         return this.diffSession.subscribe(msg, this.delivery, (reply) => this.emit(reply));
       case "diff.unsubscribe.request":
         return this.delivery.release(msg.subscriptionId);
-      case "checkout_status_request":
-        return this.checkoutSession.handleStatusRequest(msg);
-      case "checkout.commits.list.request":
-        return this.checkoutSession.handleCommitsListRequest(msg);
-      case "checkout.worktrees.list.request":
-        return this.checkoutSession.handleWorktreesListRequest(msg);
-      case "checkout.commits.file_diff.request":
-        return this.checkoutSession.handleCommitFileDiffRequest(msg, this.delivery.requestSignal);
-      case "validate_branch_request":
-        return this.checkoutSession.handleValidateBranchRequest(msg);
-      case "branch_suggestions_request":
-        return this.checkoutSession.handleBranchSuggestionsRequest(msg);
       case "directory_suggestions_request":
         return this.handleDirectorySuggestionsRequest(msg);
-      case "checkout.diff.get.request":
-        return this.checkoutSession.handleReadDiffRequest(msg);
       case "subscribe_checkout_diff_request":
         return this.checkoutSession.handleSubscribeDiffRequest(msg, this.delivery);
       case "unsubscribe_checkout_diff_request":

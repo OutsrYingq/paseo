@@ -969,6 +969,7 @@ export interface MergeToBaseOptions {
   baseRef?: string;
   mode?: "merge" | "squash";
   commitMessage?: string;
+  validateTarget?(cwd: string): Promise<void>;
 }
 
 export interface MergeFromBaseOptions {
@@ -983,6 +984,7 @@ export interface CheckoutContext {
   facts?: CheckoutSnapshotFacts | null;
   readSession?: CheckoutReadSession;
   runGitCommand?: RunGitCommand;
+  validatePushRemote?(cwd: string, remote: string): Promise<void>;
   // `git config --get` results shared by the lookups of one snapshot, keyed by config key.
   // Several lookups read the same keys; this keeps each to one process.
   gitConfigReads?: Map<string, Promise<string | null>>;
@@ -1120,7 +1122,7 @@ async function getRebaseHeadBranch(cwd: string, context?: CheckoutContext): Prom
   return results.find((result): result is string => result !== null) ?? null;
 }
 
-async function getWorktreeRoot(cwd: string, context?: CheckoutContext): Promise<string | null> {
+export async function getWorktreeRoot(cwd: string, context?: CheckoutContext): Promise<string | null> {
   try {
     const { stdout } = await getRunGitCommand(context)(["rev-parse", "--show-toplevel"], {
       cwd,
@@ -1651,7 +1653,10 @@ export async function resolveAbsoluteGitDir(
   }
 }
 
-async function resolveGitCommonDir(cwd: string, context?: CheckoutContext): Promise<string | null> {
+export async function resolveGitCommonDir(
+  cwd: string,
+  context?: CheckoutContext,
+): Promise<string | null> {
   try {
     const { stdout } = await getRunGitCommand(context)(["rev-parse", "--git-common-dir"], {
       cwd,
@@ -1786,7 +1791,9 @@ function resolveMergeTargetBranch(baseRef: string): string {
   if (baseRef.startsWith(remotePrefix) && !baseRef.startsWith(originPrefix)) {
     throw new Error(`No local merge target is recorded for base ref ${baseRef}`);
   }
-  return branchNameFromRef(baseRef);
+  const branch = branchNameFromRef(baseRef);
+  if (branch.startsWith("-")) throw new Error(`Invalid merge target: ${branch}`);
+  return branch;
 }
 
 async function doesGitRefExist(
@@ -4254,6 +4261,7 @@ export async function mergeToBase(
 
   const baseWorktree = await getWorktreePathForBranch(cwd, normalizedBaseRef);
   const operationCwd = baseWorktree ?? currentWorktreeRoot;
+  await options.validateTarget?.(operationCwd);
   const isSameCheckout = resolve(operationCwd) === resolve(currentWorktreeRoot);
   const originalBranch = await getCurrentBranch(operationCwd);
   const mode = options.mode ?? "merge";
@@ -4451,6 +4459,9 @@ export async function pushCurrentBranch(
   // The status a client acted on can be older than the git configuration, so the destination is
   // resolved again before anything is sent.
   const target = await resolvePushTarget({ cwd, storedBranchName, context });
+  if (target.kind !== "refused") {
+    await context?.validatePushRemote?.(cwd, target.remoteName);
+  }
   switch (target.kind) {
     case "refused":
       throw new Error(target.reason);
@@ -4832,6 +4843,7 @@ export async function createPullRequest(
   // the forge resolver has already matched the origin remote to a forge. If the
   // adapter still fails after the push, retrying is safe — the non-force push
   // of the head branch is idempotent.
+  await context?.validatePushRemote?.(cwd, "origin");
   await runGitCommand(["push", "-u", "origin", head], { cwd, timeout: 120_000 });
 
   const result = await forgeService.createPullRequest({
