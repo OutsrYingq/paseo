@@ -27,6 +27,7 @@ import { AgentStorage } from "../agent/agent-storage.js";
 import { respondToAgentPermission } from "../agent/permission-response.js";
 import { buildAgentPrompt } from "../agent/prompt-attachments.js";
 import { ProviderSnapshotManager } from "../agent/provider-snapshot-manager.js";
+import { PROVIDER_BACKGROUND_REFRESH_INTERVAL_MS } from "../agent/provider-refresh-schedule.js";
 import { shutdownAgentClients } from "../agent/provider-registry.js";
 import { CreationService } from "../creation/index.js";
 import { MessageReceipts } from "../message-receipts/index.js";
@@ -68,6 +69,7 @@ export async function openCentralAgents(
     extraClients: clients,
     executionOnly: true,
     resolveCwd: (cwd) => cwd,
+    backgroundRefresh: { intervalMs: PROVIDER_BACKGROUND_REFRESH_INTERVAL_MS },
   });
   const manager = new AgentManager({
     ...options.manager,
