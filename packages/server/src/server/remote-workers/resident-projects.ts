@@ -1,6 +1,12 @@
 import { mkdir, realpath, rmdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import type { DirectorySuggestionsRequest, DirectorySuggestionsResponse } from "@getpaseo/protocol/messages";
+import {
+  searchDirectoryEntries,
+  WORKSPACE_SEARCH_HIDDEN_DIRECTORIES,
+  type DirectorySuggestionEntry,
+} from "../../utils/directory-suggestions.js";
 import { expandTilde } from "../../utils/path.js";
 import { getCheckoutIdentity } from "../../utils/checkout-git.js";
 import { isSameOrDescendantPath } from "../path-utils.js";
@@ -49,6 +55,50 @@ export async function changeProjectDirectory(
     const code = (error as NodeJS.ErrnoException).code;
     if (code) throw new WorkerOperationError(code);
     throw error;
+  }
+}
+
+export async function suggestResidentDirectories(
+  roots: readonly string[],
+  request: DirectorySuggestionsRequest,
+): Promise<DirectorySuggestionsResponse> {
+  const { cwd, requestId, includeFiles, includeDirectories, matchMode, limit = 20 } = request;
+  try {
+    const workspace = cwd?.trim();
+    const query = workspace
+      ? request.query
+      : request.query.replace(/^~(?=$|[\\/])/u, () => homedir());
+    const entries = new Map<string, DirectorySuggestionEntry>();
+    const searchRoots = workspace ? [await resolveProjectParent(roots, workspace)] : roots;
+    for (const root of searchRoots) {
+      const matches = await searchDirectoryEntries({
+        root,
+        query,
+        pathFormat: workspace ? "relative" : "absolute",
+        pathQueryPolicy: workspace ? "slashes" : "rooted",
+        blankQueryBehavior: workspace ? "children" : "none",
+        traversableHiddenDirectoryNames: workspace ? WORKSPACE_SEARCH_HIDDEN_DIRECTORIES : [],
+        confidentResultScanThreshold: workspace ? undefined : 5_000,
+        respectGitIgnore: Boolean(workspace),
+        includeFiles,
+        includeDirectories,
+        matchMode,
+        limit,
+      });
+      for (const entry of matches) {
+        entries.set(entry.path, entry);
+        if (entries.size === limit) break;
+      }
+      if (entries.size === limit) break;
+    }
+    const candidates = [...entries.values()];
+    const directories = candidates.filter((entry) => entry.kind === "directory").map((entry) => entry.path);
+    return { type: "directory_suggestions_response", payload: { requestId, directories, entries: candidates, error: null } };
+  } catch (error) {
+    return {
+      type: "directory_suggestions_response",
+      payload: { requestId, directories: [], entries: [], error: error instanceof Error ? error.message : String(error) },
+    };
   }
 }
 

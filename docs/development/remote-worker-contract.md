@@ -25,6 +25,7 @@ Standalone and Central share command discovery, agent configuration, workspace s
 Central authorizes public requests and binds subscriptions to their client socket. Files, Git, scripts, and provider operations run through typed requests on the admitted resident connection. Update the calls, results, and events in the corresponding domain protocol together. The private connection negotiates workspace operation support before Central sends new operations or advertises their public features.
 
 - `central-directory.ts` owns project and workspace records. Directory inspection and Git worktree materialization run on the resident. Central persists placement and trust metadata, then dispatches setup. Registry mutations drive workspace subscriptions, including workspaces created without agents.
+- The resident resolves project suggestions and searches admitted directories. Workspace label changes use the standalone transaction log, stored on the resident volume.
 - `central-checkout.ts` routes checkout requests. The resident invokes the same checkout handlers and diff manager as standalone. Both JSON and binary diff subscriptions use the original resident watcher. Public delivery controls acknowledgment and release.
 - The resident builds commit and pull request prompts from its checkout and project settings. Central invokes the configured provider in the same worker scope. The resident validates the checkout again when applying the Git operation.
 - Central archives workspace and agent records before asking the resident to remove an owned checkout. The resident rechecks the archive stamp and live workspace references before removal. Recovery uses the recorded checkout path. Plugin-managed checkouts are retained.
@@ -35,6 +36,7 @@ Central authorizes public requests and binds subscriptions to their client socke
 - Host settings store agent and terminal profiles, metadata generation, and the usage toggle on the resident. The embedding operator owns listen, authentication, Relay, and native provider settings.
 - Usage reports and legacy provider usage come from the resident's usage-source registry. Provider launch environments and credentials stay on that resident. Central streams the report entries to the requesting client.
 - Chat search and the prompt index use the same timeline queries as standalone, against the admitted worker's agent history.
+- Provider subagent timelines and background work use the same handlers as standalone. Central projects updates for each authorized subscription.
 
 ## Scoped refresh and restart
 

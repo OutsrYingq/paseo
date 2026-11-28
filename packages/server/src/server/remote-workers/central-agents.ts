@@ -8,7 +8,7 @@ import type { WorkspaceRegistry } from "../workspace-registry.js";
 import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 import type { AgentCreateRequest, SendAgentMessageRequest } from "@getpaseo/protocol/messages";
-import { AgentManager, type AgentManagerOptions } from "../agent/agent-manager.js";
+import { AgentManager, type AgentManagerEvent, type AgentManagerOptions } from "../agent/agent-manager.js";
 import { buildStoredAgentPayload } from "../agent/agent-projections.js";
 import {
   sendPromptToAgent,
@@ -48,10 +48,19 @@ import { AgentConfigSession } from "../session/agent-config/agent-config-session
 import { createCentralHistory } from "./central-history.js";
 import { listAgentCommands } from "../session/agent-config/list-agent-commands.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "@getpaseo/protocol/messages";
+import {
+  handleAgentOrchestrationRequest,
+  projectProviderSubagentUpdate,
+  readBackgroundWorkUpdate,
+} from "../session/agent-history/agent-orchestration.js";
 
 export type CentralTimelineUpdate = Extract<
   SessionOutboundMessage,
   { type: "agent_stream" | "agent.timeline.replacement" }
+>;
+export type CentralOrchestrationEvent = Extract<
+  AgentManagerEvent,
+  { type: "provider_subagent" | "background_work" }
 >;
 
 type ResolveAttachments = ReturnType<typeof createRemoteFileTransfer>["resolveAttachments"];
@@ -66,7 +75,7 @@ export interface CentralAgentOptions {
 
 export async function openCentralAgents(
   options: CentralAgentOptions,
-  publish: (event: CentralTimelineUpdate) => void,
+  publish: (event: CentralTimelineUpdate | CentralOrchestrationEvent) => void,
   signal: AbortSignal,
 ) {
   const { logger, state } = options;
@@ -104,6 +113,10 @@ export async function openCentralAgents(
   const stopEvents = manager.subscribe(
     (event) => {
       if (signal.aborted) return;
+      if (event.type === "provider_subagent" || event.type === "background_work") {
+        publish(event);
+        return;
+      }
       if (event.type === "timeline_replacement") {
         publish({
           type: "agent.timeline.replacement",
@@ -447,6 +460,18 @@ export async function openCentralAgents(
     timelineHead: (agentId: string) => manager.getLoadedTimelineHead(agentId),
     manager,
     catalog,
+    createOrchestrationSession(
+      client: Pick<Parameters<typeof handleAgentOrchestrationRequest>[0], "authorization" | "supports">,
+    ) {
+      const deps = { ...dependencies, ...client };
+      return {
+        dispatch: (request: Parameters<typeof handleAgentOrchestrationRequest>[1]) =>
+          handleAgentOrchestrationRequest(deps, request),
+        projectProviderSubagentUpdate: (event: Extract<CentralOrchestrationEvent, { type: "provider_subagent" }>["event"]) =>
+          projectProviderSubagentUpdate({ ...deps, event }),
+        backgroundWorkUpdate: (agentId: string) => readBackgroundWorkUpdate(deps, agentId),
+      };
+    },
     createArchiveSession(
       options: Omit<Parameters<typeof createCentralWorkspaceArchive>[0],
         "agentManager" | "agentStorage" | "logger" | "unarchiveAgent">,

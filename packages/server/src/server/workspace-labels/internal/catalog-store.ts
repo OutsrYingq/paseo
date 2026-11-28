@@ -50,6 +50,15 @@ export class WorkspaceLabelStorageUncertainError extends Error {
   }
 }
 
+async function readLocalText(filePath: string): Promise<string | null> {
+  try {
+    return await fs.readFile(filePath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
 export class WorkspaceLabelCatalogStore {
   private loaded = false;
   private initializing: Promise<void> | null = null;
@@ -69,6 +78,7 @@ export class WorkspaceLabelCatalogStore {
       transaction: unknown,
     ) => Promise<void> = writeJsonFileAtomic,
     private readonly removeTransaction: (filePath: string) => Promise<void> = fs.rm,
+    private readonly readText: (filePath: string) => Promise<string | null> = readLocalText,
   ) {}
 
   async initialize(): Promise<void> {
@@ -168,27 +178,13 @@ export class WorkspaceLabelCatalogStore {
   }
 
   private async readCatalog(): Promise<WorkspaceLabelDefinition[]> {
-    try {
-      const raw = await fs.readFile(this.filePath, "utf8");
-      return z.array(WorkspaceLabelDefinitionSchema).parse(JSON.parse(raw));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-      throw error;
-    }
+    const raw = await this.readText(this.filePath);
+    return raw === null ? [] : z.array(WorkspaceLabelDefinitionSchema).parse(JSON.parse(raw));
   }
 
   private async readTransaction(): Promise<WorkspaceLabelTransaction | null> {
-    try {
-      return await this.requireTransaction();
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-      throw error;
-    }
-  }
-
-  private async requireTransaction(): Promise<WorkspaceLabelTransaction> {
-    const raw = await fs.readFile(this.transactionPath, "utf8");
-    return WorkspaceLabelTransactionSchema.parse(JSON.parse(raw));
+    const raw = await this.readText(this.transactionPath);
+    return raw === null ? null : WorkspaceLabelTransactionSchema.parse(JSON.parse(raw));
   }
 
   private async recover(transaction: WorkspaceLabelTransaction): Promise<void> {

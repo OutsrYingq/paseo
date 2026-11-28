@@ -99,6 +99,16 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
         return;
       }
       if (fs.existsSync(process.env.FIXTURE_STATE + '/require-permission')) {
+        send({ method: 'item/completed', params: {
+          threadId: 'shared-native-id', turnId: 't1',
+          item: { type: 'collabAgentToolCall', id: 'child-call', tool: 'spawnAgent', status: 'completed',
+            prompt: 'Inspect fixture directory', receiverThreadIds: ['fixture-child'],
+            agentsStates: { 'fixture-child': { status: 'pendingInit', message: null } } }
+        } });
+        send({ method: 'item/completed', params: {
+          threadId: 'fixture-child', turnId: 'child-turn',
+          item: { type: 'agentMessage', id: 'child-reply', text: 'Found the fixture directory.' }
+        } });
         send({ jsonrpc: '2.0', id: 8001, method: 'item/commandExecution/requestApproval',
           params: { itemId: 'fixture-command', threadId: 'shared-native-id', turnId: 't1', command: 'echo fixture', cwd: process.env.FIXTURE_STATE } });
       } else if (!turnHeld()) setTimeout(() => send({ method: 'turn/completed', params: { threadId: 'shared-native-id', turn: { id: 't1', status: 'completed' } } }), 250);
@@ -462,6 +472,17 @@ it("imports and rewinds an OMP history through the public SDK", async () => {
   const nested = path.join(recentProject, "src");
   await mkdir(nested, { recursive: true });
   execFileSync("git", ["init", recentProject], { stdio: "pipe" });
+  expect((await client.getDirectorySuggestions({ query: "", cwd: recentProject })).entries).toEqual([
+    { path: "src", kind: "directory" },
+  ]);
+  expect((await client.getDirectorySuggestions({ query: recentProject })).directories).toContain(
+    recentProject,
+  );
+  expect((await other.getDirectorySuggestions({ query: recentProject })).entries).toEqual([]);
+  expect(await other.getDirectorySuggestions({ query: "", cwd: recentProject })).toMatchObject({
+    entries: [],
+    error: "worker_workspace_root_denied",
+  });
   const recentProjectId = randomUUID();
   await writeFile(
     path.join(cwd, "native-sessions", `test_${recentProjectId}.jsonl`),
@@ -473,6 +494,31 @@ it("imports and rewinds an OMP history through the public SDK", async () => {
   expect((await other.listProjectSuggestions(recent)).suggestions).toEqual([]);
   expect((await client.addProject(recentProject)).project?.projectRootPath).toBe(recentProject);
   expect((await client.listProjectSuggestions(recent)).suggestions).toEqual([]);
+
+  const labels = client.observeWorkspaceLabels();
+  cleanups.push(() => labels.release());
+  const names = new Set<string>();
+  labels.subscribe({
+    snapshot() {},
+    update(message) {
+      if (message.type === "workspace.label.update" && message.payload.kind === "upsert") {
+        names.add(message.payload.label.name);
+      }
+    },
+  });
+  await labels.ready;
+  await client.setWorkspaceLabel({
+    workspaceId, label: { name: "Review", color: "blue" }, assigned: true,
+  });
+  await client.updateWorkspaceLabel({ name: "Review", newName: "Reviewed" });
+  await expect.poll(() => names.has("Reviewed")).toBe(true);
+  expect((await client.fetchWorkspaces()).entries).toContainEqual(
+    expect.objectContaining({ id: workspaceId, labels: ["Reviewed"] }),
+  );
+  expect(JSON.parse(await readFile(path.join(cwd, "projects", "workspace-labels.json"), "utf8")))
+    .toEqual([{ name: "Reviewed", color: "blue" }]);
+  expect(await other.listWorkspaceLabels()).toMatchObject({ labels: [] });
+  await labels.release();
 }, 30_000);
 
 it("uses the unchanged SDK against two mTLS residents and isolated native and download paths", async () => {
@@ -897,6 +943,20 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
       },
     });
     await permissions.ready;
+    const subagentEvents = a.observeEvents(["agent.provider_subagents.update"]);
+    cleanups.push(() => subagentEvents.release());
+    const childUpdates: string[] = [];
+    subagentEvents.subscribe({
+      snapshot() {},
+      update(message) {
+        if (
+          message.type === "agent.provider_subagents.update" &&
+          message.payload.kind === "timeline" &&
+          message.payload.item.type === "assistant_message"
+        ) childUpdates.push(message.payload.item.text);
+      },
+    });
+    await subagentEvents.ready;
     const requirePermission = path.join(root, "a", "require-permission");
     await writeFile(requirePermission, "");
     const send = (client: DaemonClient) =>
@@ -909,6 +969,17 @@ it("uses the unchanged SDK against two mTLS residents and isolated native and do
     expect((await a.fetchAgent(agentId))?.agent.pendingPermissions.map(({ id }) => id)).toContain(
       permissionId,
     );
+    const ownedChild = (await a.listProviderSubagents(agentId)).subagents[0];
+    if (!ownedChild) throw new Error("Codex fixture did not publish a subagent");
+    expect((await b.listProviderSubagents(agentId)).subagents).toEqual([]);
+    expect(await a.fetchProviderSubagentTimeline(agentId, ownedChild.id)).toMatchObject({
+      rows: [{ item: { type: "assistant_message", text: "Found the fixture directory." } }],
+    });
+    await expect(b.fetchProviderSubagentTimeline(agentId, ownedChild.id)).rejects.toThrow(
+      "Provider subagent not found",
+    );
+    await expect.poll(() => childUpdates).toContain("Found the fixture directory.");
+    await subagentEvents.release();
     await a.respondToPermission(agentId, permissionId, { behavior: "allow" });
     const scopedUsage = await a.listUsageReports({ agentId });
     expect(scopedUsage.reports).toMatchObject([

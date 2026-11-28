@@ -11,6 +11,11 @@ import {
 } from "./session/workspace-base-branch/service.js";
 import type { WorkspaceBaseBranchSetRequest } from "@getpaseo/protocol/messages";
 
+import {
+  handleAgentOrchestrationRequest,
+  projectProviderSubagentUpdate,
+  readBackgroundWorkUpdate,
+} from "./session/agent-history/agent-orchestration.js";
 import { queryAgentTimeline } from "./session/agent-history/timeline-query.js";
 import type { BrowserToolsBroker } from "./browser-tools/broker.js";
 import { BrowserAutomationHostCapabilitySchema } from "@getpaseo/protocol/browser-automation/capabilities";
@@ -28,10 +33,6 @@ import type {
   AgentCreateRequest,
 } from "@getpaseo/protocol/messages";
 import type { MessageReceipts } from "./message-receipts/index.js";
-import {
-  isDaemonBackgroundWorkItem,
-  type AgentBackgroundWorkItem,
-} from "./agent/background-work/index.js";
 import equal from "fast-deep-equal";
 import { WorkspaceSetupObservation } from "./workspace-setup-observation.js";
 import { SessionDelivery, type OwnedSubscription } from "./session/owned-subscriptions/index.js";
@@ -122,11 +123,11 @@ import {
   formatWorkspaceAutomationBlockedMessage,
   isCheckoutUntrusted,
 } from "./workspace-automation-gate.js";
+import type { WorkspaceLabelService } from "./workspace-labels/index.js";
 import {
-  WorkspaceLabelError,
-  WorkspaceLabelStorageUncertainError,
-  type WorkspaceLabelService,
-} from "./workspace-labels/index.js";
+  handleWorkspaceLabelRequest,
+  isWorkspaceLabelRequest,
+} from "./session/workspace-labels/label-session.js";
 
 import { AgentManager, AgentRunCancellationError } from "./agent/agent-manager.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
@@ -737,17 +738,6 @@ function hasInitialCreationPrompt(
     buildAgentPrompt(request.initialPrompt?.trim() ?? "", request.images, request.attachments)
       .length,
   );
-}
-
-function workspaceLabelErrorCode(error: unknown): string {
-  if (
-    error instanceof WorkspaceLabelError ||
-    error instanceof WorkspaceLabelStorageUncertainError ||
-    error instanceof SessionRequestError
-  ) {
-    return error.code;
-  }
-  return "workspace_label_failed";
 }
 
 interface ClientActivity {
@@ -2152,68 +2142,26 @@ export class Session {
     }
   }
 
-  private supportsSubagentTimelineItem(
-    item: AgentTimelineFetchResult["rows"][number]["item"],
-    source?: object,
-  ): boolean {
-    // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove gate after 2027-03-14.
-    const supportsProjection = source
-      ? this.supportsForSource(CLIENT_CAPS.projectedSubagentTimeline, source)
-      : this.supports(CLIENT_CAPS.projectedSubagentTimeline);
-    return supportsProjection && this.supportsTimelineItem(item, source);
-  }
-
-  private forwardProviderSubagentUpdate(
-    update: Extract<AgentManagerEvent, { type: "provider_subagent" }>["event"],
-  ): void {
-    let message: SessionOutboundMessage;
-    if (update.type === "upsert") {
-      message = {
-        type: "agent.provider_subagents.update",
-        payload: { kind: "upsert", subagent: update.subagent },
-      };
-    } else if (update.type === "timeline") {
-      message = {
-        type: "agent.provider_subagents.update",
-        payload: {
-          kind: "timeline",
-          parentAgentId: update.parentAgentId,
-          subagentId: update.subagentId,
-          provider: update.provider,
-          item: update.row.item,
-          timestamp: update.row.timestamp,
-          seq: update.row.seq,
-          epoch: update.epoch,
-        },
-      };
-    } else {
-      message = {
-        type: "agent.provider_subagents.update",
-        payload: {
-          kind: "remove",
-          parentAgentId: update.parentAgentId,
-          subagentId: update.subagentId,
-        },
-      };
-    }
-
+  private forwardProviderSubagentUpdate(event: ProviderSubagentManagerEvent): void {
+    const project = (source?: object) =>
+      projectProviderSubagentUpdate({
+        agentManager: this.agentManager,
+        event,
+        supports: (capability) =>
+          source ? this.supportsForSource(capability, source) : this.supports(capability),
+      });
     const delivered = new Set<object>();
     for (const subscription of this.eventSubscriptions.values()) {
       if (!subscription.events.has("agent.provider_subagents.update")) continue;
-      if (
-        update.type === "timeline" &&
-        !this.supportsSubagentTimelineItem(update.row.item, subscription.owner.source)
-      )
-        continue;
+      const message = project(subscription.owner.source);
+      if (!message) continue;
       subscription.owner.emit(message);
       delivered.add(subscription.owner.source);
     }
     if (this.clientSources.size === 0 || !this.onMessageToSource) {
-      if (
-        this.supports(CLIENT_CAPS.providerSubagents) &&
-        (update.type !== "timeline" || this.supportsSubagentTimelineItem(update.row.item))
-      ) {
-        this.emit(message);
+      if (this.supports(CLIENT_CAPS.providerSubagents)) {
+        const message = project();
+        if (message) this.emit(message);
       }
       return;
     }
@@ -2224,9 +2172,8 @@ export class Session {
         !capabilities.has(CLIENT_CAPS.providerSubagents)
       )
         continue;
-      if (update.type === "timeline" && !this.supportsSubagentTimelineItem(update.row.item, source))
-        continue;
-      this.onMessageToSource(source, message);
+      const message = project(source);
+      if (message) this.onMessageToSource(source, message);
     }
   }
 
@@ -2362,41 +2309,24 @@ export class Session {
   }
 
   private forwardProviderSubagent(event: ProviderSubagentManagerEvent): void {
-    const parentAgentId =
-      event.type === "upsert" ? event.subagent.parentAgentId : event.parentAgentId;
-    if (this.agentManager.getAgent(parentAgentId)?.internal) return;
     this.emitProviderSubagentWorkspaceUpdate(event);
     this.forwardProviderSubagentUpdate(event);
   }
 
   private async forwardBackgroundWork(agentId: string): Promise<void> {
-    const target = await this.resolveBackgroundWorkAgent(agentId);
-    if ("error" in target) return;
-    const { agent, record } = target;
-    // The inventory may have changed while resolving a dormant agent.
-    const items = this.agentManager.getAgentBackgroundWorkSummary(agentId)
-      ? this.agentManager.listAgentBackgroundWork(agentId)
-      : [];
-    this.emit({
-      type: "agent.background_work.update",
-      payload: { agentId, items: this.projectBackgroundWorkItems(items) },
-    });
+    const update = await readBackgroundWorkUpdate(
+      {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        authorization: this.authorization,
+      },
+      agentId,
+    );
+    if (!update) return;
+    const { agent, record, message } = update;
+    this.emit(message);
     if (agent) await this.agentUpdates.forwardLiveAgent(agent);
     else if (record) await this.agentUpdates.forwardStoredAgent(record);
-  }
-
-  private projectBackgroundWorkItems(items: AgentBackgroundWorkItem[]): AgentBackgroundWorkItem[] {
-    if (
-      this.authorization.allowsPermission("automation.manage") &&
-      this.authorization.allowsInbound({ type: "agent.background_work.stop.request" })
-    ) {
-      return items;
-    }
-    return items.map((item) => {
-      if (!isDaemonBackgroundWorkItem(item)) return item;
-      const { canStop: _canStop, stopToken: _stopToken, ...visible } = item;
-      return visible;
-    });
   }
 
   private emitProviderSubagentWorkspaceUpdate(event: ProviderSubagentManagerEvent): void {
@@ -2406,7 +2336,7 @@ export class Session {
     const parentAgentId =
       event.type === "upsert" ? event.subagent.parentAgentId : event.parentAgentId;
     const parent = this.agentManager.getAgent(parentAgentId);
-    if (!parent?.workspaceId) {
+    if (!parent?.workspaceId || parent.internal) {
       return;
     }
     void this.emitWorkspaceUpdateForWorkspaceId(parent.workspaceId).catch((error) => {
@@ -3270,13 +3200,26 @@ export class Session {
           logger: this.sessionLogger,
         }, msg).then((response) => this.emitForSource(response, source));
       case "agent.provider_subagents.list.request":
-        return this.handleProviderSubagentListRequest(msg);
       case "agent.background_work.list.request":
-        return this.handleAgentBackgroundWorkListRequest(msg);
       case "agent.background_work.stop.request":
-        return this.handleAgentBackgroundWorkStopRequest(msg);
       case "agent.provider_subagents.timeline.get.request":
-        return this.handleProviderSubagentTimelineRequest(msg, source);
+        return handleAgentOrchestrationRequest(
+          {
+            agentManager: this.agentManager,
+            agentStorage: this.agentStorage,
+            logger: this.sessionLogger,
+            authorization: this.authorization,
+            supports: (capability) =>
+              source ? this.supportsForSource(capability, source) : this.supports(capability),
+          },
+          msg,
+        ).then((response) => {
+          if (response.type === "agent.provider_subagents.timeline.get.response") {
+            this.emitForSource(response, source);
+          } else {
+            this.emit(response);
+          }
+        });
       case "session.events.set_subscription.request": {
         const owner = this.delivery.begin("events", undefined, async (id) => {
           this.eventSubscriptions.delete(id);
@@ -3580,19 +3523,13 @@ export class Session {
   }
 
   private dispatchWorkspaceLabelMessage(msg: SessionInboundMessage): Promise<void> | undefined {
-    switch (msg.type) {
-      case "workspace.label.list.request":
-        return this.handleWorkspaceLabelList(msg);
-      case "workspace.label.assignment.set.request":
-        return this.handleWorkspaceLabelAssignment(msg);
-      case "workspace.label.update.request":
-        return this.handleWorkspaceLabelUpdate(msg);
-      case "workspace.label.delete.request":
-        return this.handleWorkspaceLabelDelete(msg);
-      case "workspace.label.delete.inspect.request":
-        return this.handleWorkspaceLabelDeleteInspection(msg);
-      default:
-        return undefined;
+    if (isWorkspaceLabelRequest(msg)) {
+      return handleWorkspaceLabelRequest(
+        this.workspaceLabelService ?? undefined,
+        this.delivery,
+        (message) => this.emit(message),
+        msg,
+      );
     }
   }
 
@@ -7060,144 +6997,6 @@ export class Session {
     }
   }
 
-  private requireWorkspaceLabels(): WorkspaceLabelService {
-    if (!this.workspaceLabelService) {
-      throw new SessionRequestError("workspace_labels_unavailable", "Workspace labels unavailable");
-    }
-    return this.workspaceLabelService;
-  }
-
-  private emitWorkspaceLabelError(
-    request: { requestId: string; type: string },
-    error: unknown,
-  ): void {
-    this.emit({
-      type: "rpc_error",
-      payload: {
-        requestId: request.requestId,
-        requestType: request.type,
-        code: workspaceLabelErrorCode(error),
-        error: error instanceof Error ? error.message : "Workspace label operation failed",
-      },
-    });
-  }
-
-  private async handleWorkspaceLabelList(
-    request: Extract<SessionInboundMessage, { type: "workspace.label.list.request" }>,
-  ): Promise<void> {
-    const service = this.requireWorkspaceLabels();
-    if (!request.subscribe) {
-      this.emit({
-        type: "workspace.label.list.response",
-        payload: { requestId: request.requestId, ...(await service.list(request.sync)) },
-      });
-      return;
-    }
-    let bootstrap: ReturnType<typeof service.subscribe> | undefined;
-    const owner = this.delivery.begin("labels", request.subscribe.subscriptionId, async () => {
-      await bootstrap?.then(
-        (subscription) => subscription.unsubscribe(),
-        () => undefined,
-      );
-    });
-    try {
-      type LiveChange = Parameters<Parameters<typeof service.subscribe>[0]["onChange"]>[0];
-      const pending = new Map<string, LiveChange>();
-      let ready = false;
-      const emitChange = (change: LiveChange): void => {
-        owner.emit({
-          type: "workspace.label.update",
-          payload: change,
-        });
-      };
-      bootstrap = service.subscribe({
-        cursor: request.sync,
-        onChange: (change) => {
-          if (owner.signal.aborted) return;
-          if (!ready)
-            pending.set(change.kind === "upsert" ? change.label.name : change.name, change);
-          else emitChange(change);
-        },
-      });
-      const subscription = await bootstrap;
-      if (owner.signal.aborted) return;
-      this.emit({
-        type: "workspace.label.list.response",
-        payload: {
-          requestId: request.requestId,
-          subscriptionId: owner.responseId,
-          ...subscription.snapshot,
-        },
-      });
-      ready = true;
-      for (const change of pending.values()) {
-        if (change.seq > subscription.snapshot.sync.headSeq) emitChange(change);
-      }
-      pending.clear();
-    } catch (error) {
-      await owner.release();
-      this.emitWorkspaceLabelError(request, error);
-    }
-  }
-
-  private async handleWorkspaceLabelAssignment(
-    request: Extract<SessionInboundMessage, { type: "workspace.label.assignment.set.request" }>,
-  ): Promise<void> {
-    try {
-      const result = await this.requireWorkspaceLabels().setAssignment(request);
-      this.emit({
-        type: "workspace.label.assignment.set.response",
-        payload: { requestId: request.requestId, ...result },
-      });
-    } catch (error) {
-      this.emitWorkspaceLabelError(request, error);
-    }
-  }
-
-  private async handleWorkspaceLabelUpdate(
-    request: Extract<SessionInboundMessage, { type: "workspace.label.update.request" }>,
-  ): Promise<void> {
-    try {
-      const result = await this.requireWorkspaceLabels().update(request);
-      this.emit({
-        type: "workspace.label.update.response",
-        payload: { requestId: request.requestId, ...result },
-      });
-    } catch (error) {
-      this.emitWorkspaceLabelError(request, error);
-    }
-  }
-
-  private async handleWorkspaceLabelDelete(
-    request: Extract<SessionInboundMessage, { type: "workspace.label.delete.request" }>,
-  ): Promise<void> {
-    try {
-      const result = await this.requireWorkspaceLabels().delete(request.name);
-      this.emit({
-        type: "workspace.label.delete.response",
-        payload: { requestId: request.requestId, ...result },
-      });
-    } catch (error) {
-      this.emitWorkspaceLabelError(request, error);
-    }
-  }
-
-  private async handleWorkspaceLabelDeleteInspection(
-    request: Extract<SessionInboundMessage, { type: "workspace.label.delete.inspect.request" }>,
-  ): Promise<void> {
-    try {
-      const affectedWorkspaceCount = await this.requireWorkspaceLabels().countAffectedWorkspaces(
-        request.name,
-      );
-      this.emit({
-        type: "workspace.label.delete.inspect.response",
-        payload: { requestId: request.requestId, affectedWorkspaceCount },
-      });
-    } catch (error) {
-      this.emitWorkspaceLabelError(request, error);
-    }
-  }
-
   private async readAgentDirectorySync(
     request: Extract<SessionInboundMessage, { type: "fetch_agents_request" }>,
     backgroundVisibility: BackgroundVisibility,
@@ -8606,213 +8405,6 @@ export class Session {
       type: "agent.timeline.append.response",
       payload: { requestId: msg.requestId, seq, epoch },
     });
-  }
-
-  private async handleProviderSubagentListRequest(
-    msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.list.request" }>,
-  ): Promise<void> {
-    try {
-      await ensureUnarchivedAgentLoaded(msg.parentAgentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
-      this.emit({
-        type: "agent.provider_subagents.list.response",
-        payload: {
-          requestId: msg.requestId,
-          parentAgentId: msg.parentAgentId,
-          subagents: this.agentManager.listProviderSubagents(msg.parentAgentId),
-          error: null,
-        },
-      });
-    } catch (error) {
-      this.emit({
-        type: "agent.provider_subagents.list.response",
-        payload: {
-          requestId: msg.requestId,
-          parentAgentId: msg.parentAgentId,
-          subagents: [],
-          error: error instanceof Error ? error.message : String(error),
-        },
-      });
-    }
-  }
-
-  private async handleAgentBackgroundWorkStopRequest(
-    msg: Extract<SessionInboundMessage, { type: "agent.background_work.stop.request" }>,
-  ): Promise<void> {
-    let error: string | null = null;
-    try {
-      const target = await this.resolveBackgroundWorkAgent(msg.agentId);
-      if ("error" in target) throw new Error(target.error);
-      await this.agentManager.stopAgentBackgroundWork({
-        agentId: msg.agentId,
-        itemId: msg.itemId,
-        stopToken: msg.stopToken,
-        canManageAutomation: this.authorization.allowsPermission("automation.manage"),
-      });
-    } catch (cause) {
-      error = cause instanceof Error ? cause.message : String(cause);
-    }
-    this.emit({
-      type: "agent.background_work.stop.response",
-      payload: {
-        requestId: msg.requestId,
-        agentId: msg.agentId,
-        itemId: msg.itemId,
-        error,
-      },
-    });
-  }
-
-  private async handleAgentBackgroundWorkListRequest(
-    msg: Extract<SessionInboundMessage, { type: "agent.background_work.list.request" }>,
-  ): Promise<void> {
-    try {
-      this.emit({
-        type: "agent.background_work.list.response",
-        payload: {
-          requestId: msg.requestId,
-          agentId: msg.agentId,
-          items: await this.readAgentBackgroundWork(msg.agentId),
-          error: null,
-        },
-      });
-    } catch (error) {
-      this.emit({
-        type: "agent.background_work.list.response",
-        payload: {
-          requestId: msg.requestId,
-          agentId: msg.agentId,
-          items: [],
-          error: error instanceof Error ? error.message : String(error),
-        },
-      });
-    }
-  }
-
-  private async readAgentBackgroundWork(agentId: string): Promise<AgentBackgroundWorkItem[]> {
-    const target = await this.resolveBackgroundWorkAgent(agentId);
-    if ("error" in target) throw new Error(target.error);
-    if (!this.agentManager.getAgentBackgroundWorkSummary(agentId)) {
-      throw new Error("Background work inventory is unavailable");
-    }
-    return this.projectBackgroundWorkItems(this.agentManager.listAgentBackgroundWork(agentId));
-  }
-
-  private async resolveBackgroundWorkAgent(
-    agentId: string,
-  ): Promise<{ agent: ManagedAgent | null; record: StoredAgentRecord | null } | { error: string }> {
-    const record = await this.agentStorage.get(agentId);
-    const agent = this.agentManager.getAgent(agentId);
-    if ((!agent && !record) || agent?.internal || record?.internal) {
-      return { error: `Unknown agent '${agentId}'` };
-    }
-    if (record?.archivedAt) {
-      return { error: `Agent is archived: ${agentId}` };
-    }
-    return { agent, record };
-  }
-
-  private async handleProviderSubagentTimelineRequest(
-    msg: Extract<SessionInboundMessage, { type: "agent.provider_subagents.timeline.get.request" }>,
-    source?: object,
-  ): Promise<void> {
-    const direction: AgentTimelineFetchDirection = msg.direction ?? (msg.cursor ? "after" : "tail");
-    try {
-      await ensureUnarchivedAgentLoaded(msg.parentAgentId, {
-        agentManager: this.agentManager,
-        agentStorage: this.agentStorage,
-        logger: this.sessionLogger,
-      });
-      const descriptor = this.agentManager.getProviderSubagent(msg.parentAgentId, msg.subagentId);
-      if (!descriptor) {
-        throw new Error("Provider subagent not found");
-      }
-      // COMPAT(projectedSubagentTimeline): added after v0.8.0, remove after 2027-03-14.
-      const supportsProjection = source
-        ? this.supportsForSource(CLIENT_CAPS.projectedSubagentTimeline, source)
-        : this.supports(CLIENT_CAPS.projectedSubagentTimeline);
-      const timeline = this.agentManager.fetchProviderSubagentTimeline(
-        msg.parentAgentId,
-        msg.subagentId,
-        {
-          direction,
-          cursor: msg.cursor,
-          limit: msg.limit ?? (direction === "after" ? 0 : 200),
-        },
-      );
-      const rows = timeline.rows.filter((row) => this.supportsTimelineItem(row.item, source));
-      this.emitForSource(
-        {
-          type: "agent.provider_subagents.timeline.get.response",
-          payload: {
-            requestId: msg.requestId,
-            parentAgentId: msg.parentAgentId,
-            subagentId: msg.subagentId,
-            provider: descriptor.provider,
-            direction,
-            epoch: timeline.epoch,
-            projection: "projected",
-            startCursor:
-              timeline.startSeq === null ? null : { epoch: timeline.epoch, seq: timeline.startSeq },
-            endCursor:
-              timeline.endSeq === null ? null : { epoch: timeline.epoch, seq: timeline.endSeq },
-            reset: timeline.reset,
-            staleCursor: timeline.staleCursor,
-            gap: timeline.gap,
-            window: timeline.window,
-            hasOlder: supportsProjection && timeline.hasOlder,
-            hasNewer: supportsProjection && timeline.hasNewer,
-            rows: supportsProjection
-              ? rows.map((row) => ({
-                  item: row.item,
-                  timestamp: row.timestamp,
-                  seq: row.seqEnd,
-                  seqStart: row.seqStart,
-                  seqEnd: row.seqEnd,
-                  sourceSeqRanges: row.sourceSeqRanges,
-                }))
-              : [
-                  {
-                    seq: timeline.window.maxSeq,
-                    timestamp: new Date().toISOString(),
-                    item: {
-                      type: "assistant_message",
-                      text: "Please upgrade the Paseo app to view this subagent conversation.",
-                    },
-                  },
-                ],
-            error: null,
-          },
-        },
-        source,
-      );
-    } catch (error) {
-      this.emitForSource(
-        {
-          type: "agent.provider_subagents.timeline.get.response",
-          payload: {
-            requestId: msg.requestId,
-            parentAgentId: msg.parentAgentId,
-            subagentId: msg.subagentId,
-            provider: null,
-            direction,
-            epoch: "",
-            reset: false,
-            staleCursor: false,
-            gap: false,
-            window: { minSeq: 0, maxSeq: 0, nextSeq: 0 },
-            hasOlder: false,
-            hasNewer: false,
-            rows: [],
-            error: error instanceof Error ? error.message : String(error),
-          },
-        },
-        source,
-      );
-    }
   }
 
   private async handleAgentForkContextRequest(

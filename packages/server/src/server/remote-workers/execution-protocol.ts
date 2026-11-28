@@ -1,5 +1,7 @@
 import {
   AgentStreamEventPayloadSchema,
+  DirectorySuggestionsRequestSchema,
+  DirectorySuggestionsResponseSchema,
   FileExplorerResponseSchema,
   FileVersionSchema,
 } from "@getpaseo/protocol/messages";
@@ -112,6 +114,7 @@ export const WorkerOperationSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("unobserveWorkspaceFile"), id: z.uuid() }),
   z.strictObject({ kind: z.literal("inspectProject"), cwd: z.string().min(1) }),
   z.strictObject({ kind: z.literal("projectSuggestionRoot"), cwd: z.string().min(1) }),
+  z.strictObject({ kind: z.literal("directorySuggestions"), request: DirectorySuggestionsRequestSchema }),
   z.strictObject({ kind: z.literal("projectDirectoryParent"), parentPath: z.string().min(1) }),
   z.strictObject({
     kind: z.literal("projectDirectoryChange"),
@@ -220,6 +223,7 @@ export type WorkerEvent = z.infer<typeof WorkerEventSchema>;
 export const WORKSPACE_OPERATION_KINDS: ReadonlySet<WorkerOperation["kind"]> = new Set([
   "inspectProject",
   "projectSuggestionRoot",
+  "directorySuggestions",
   "projectDirectoryParent",
   "projectDirectoryChange",
   "mutateWorkspaceFile",
@@ -273,6 +277,7 @@ export const operationResults = {
   projectDirectoryParent: z.string().min(1),
   projectDirectoryChange: z.null(),
   projectSuggestionRoot: z.string().nullable(),
+  directorySuggestions: DirectorySuggestionsResponseSchema,
   inspectProject: PersistedProjectRecordSchema.pick({
     rootPath: true,
     kind: true,

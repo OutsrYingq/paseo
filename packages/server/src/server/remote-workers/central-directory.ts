@@ -39,6 +39,7 @@ import type { createRemoteState } from "./remote-state.js";
 import type { createRemoteScripts } from "./remote-scripts.js";
 import { WorkerOperationError } from "./execution-protocol.js";
 import { createCentralProjectManagement } from "./central-project-management.js";
+import { createWorkspaceLabelService } from "../workspace-labels/index.js";
 
 type Request = Extract<
   SessionInboundMessage,
@@ -64,6 +65,16 @@ export function createCentralDirectory(
     readRecords: state.read,
     writeRecords: (file, records) => state.write(file, JSON.stringify(records)),
   });
+  const workspaceLabels = connection.supportsWorkspaceOperations
+    ? createWorkspaceLabelService({
+        paseoHome: ".",
+        workspaceRegistry,
+        readText: state.read,
+        writeCatalog: (file, labels) => state.write(file, JSON.stringify(labels)),
+        writeTransaction: (file, transaction) => state.write(file, JSON.stringify(transaction)),
+        removeTransaction: state.remove,
+      })
+    : undefined;
   const projectRegistry = new FileBackedProjectRegistry("projects/projects.json", logger, {
     readRecords: state.read,
     writeRecords: (file, records) => state.write(file, JSON.stringify(records)),
@@ -688,6 +699,7 @@ export function createCentralDirectory(
     prepareWorkspace,
     updateCheckoutBranch,
     workspaceRegistry,
+    workspaceLabels,
     archive: dispatchWorkspaceArchive,
     manageProject: dispatchProject,
     projectRegistry,
@@ -756,7 +768,12 @@ export function createDirectorySubscriptions(options: {
       const stopProject = directory.projectRegistry.subscribeToMutations(changed);
       const stopArchive = directory.subscribeToArchiveChanges(changed);
       const stopAgent = manager.subscribe((event) => {
-        if (event.type === "agent_state" || event.type === "agent_removed") changed();
+        if (
+          event.type === "agent_state" ||
+          event.type === "agent_removed" ||
+          event.type === "background_work" ||
+          (event.type === "provider_subagent" && event.event.type !== "timeline")
+        ) changed();
       });
       function stop() {
         stopped = true;

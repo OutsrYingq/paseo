@@ -26,7 +26,11 @@ import {
   type WorkerMaintenanceResult,
 } from "./central-maintenance.js";
 import { workerHost } from "./authority.js";
-import { openCentralAgents, type CentralTimelineUpdate } from "./central-agents.js";
+import {
+  openCentralAgents,
+  type CentralOrchestrationEvent,
+  type CentralTimelineUpdate,
+} from "./central-agents.js";
 import { decodeJson, WorkerOperationError, type WorkerEvent } from "./execution-protocol.js";
 import {
   WorkerLeases,
@@ -63,6 +67,11 @@ import { createRemoteState } from "./remote-state.js";
 import { WorkerConnection, type WorkerTlsClientOptions } from "./worker-connection.js";
 import { UsageSession } from "../session/usage/usage-session.js";
 import { createCentralHostSettings } from "./central-host-settings.js";
+import { SessionDelivery } from "../session/owned-subscriptions/index.js";
+import {
+  handleWorkspaceLabelRequest,
+  isWorkspaceLabelRequest,
+} from "../session/workspace-labels/label-session.js";
 type HostSettingsEvent = Extract<SessionOutboundMessage, { type: "status" }>;
 
 export interface CentralOptions {
@@ -91,7 +100,10 @@ const connectionLostEvent = Symbol("connection lost");
 type TimelineSubscriptions = Map<string, ReadonlySet<string>>;
 
 type ScriptStatusEvent = Extract<WorkerEvent, { type: "scriptStatus" }>;
-type Delivery = (event: CentralTimelineUpdate | ScriptStatusEvent | HostSettingsEvent | typeof connectionLostEvent) => void;
+type Delivery = (
+  event: CentralTimelineUpdate | CentralOrchestrationEvent | ScriptStatusEvent |
+    HostSettingsEvent | typeof connectionLostEvent,
+) => void;
 
 export async function startRemoteCentral(options: CentralOptions) {
   const verifiedConnections = new WeakMap<ActiveWorkerTarget, WorkerConnection>();
@@ -198,9 +210,11 @@ export async function startRemoteCentral(options: CentralOptions) {
       },
       connection.signal,
     );
-    const directory = opened.then((agents) =>
-      createCentralDirectory(logger, state, agents, connection, scripts),
-    );
+    const directory = opened.then(async (agents) => {
+      const result = createCentralDirectory(logger, state, agents, connection, scripts);
+      await result.workspaceLabels?.initialize();
+      return result;
+    });
     plugins = new RemotePluginClient({
       scope: execution.target,
       signal: connection.signal,
@@ -533,6 +547,8 @@ export async function startRemoteCentral(options: CentralOptions) {
       const eventSubscriptions = new Map<string, Set<string>>();
       const creationSubscriptions = new Map<string, () => void>();
       let sessionClosed = false;
+      const labelsDelivery = new SessionDelivery((_source, update) => sendAuthorized(update));
+      labelsDelivery.attach(socket, message.capabilities?.[CLIENT_CAPS.ownedSubscriptions] === true);
       const directory = createDirectorySubscriptions({
         directory: scope.directory,
         manager: scope.manager,
@@ -601,6 +617,29 @@ export async function startRemoteCentral(options: CentralOptions) {
         },
       });
       const agentConfigSession = scope.createAgentConfigSession(sendAuthorized);
+      const orchestration = scope.createOrchestrationSession({
+        authorization,
+        supports: (capability) => message.capabilities?.[capability] === true,
+      });
+      function deliverOrchestrationUpdate(
+        event: Extract<SessionOutboundMessage, {
+          type: "agent.provider_subagents.update" | "agent.background_work.update";
+        }>,
+      ) {
+        for (const [subscriptionId, events] of eventSubscriptions) {
+          if (!events.has(event.type)) continue;
+          if (event.type === "agent.provider_subagents.update") {
+            sendAuthorized({ ...event, payload: { ...event.payload, subscriptionId } });
+          } else {
+            sendAuthorized({ ...event, payload: { ...event.payload, subscriptionId } });
+          }
+        }
+        if (
+          !message.capabilities?.[CLIENT_CAPS.explicitEventSubscriptions] &&
+          event.type === "agent.provider_subagents.update" &&
+          message.capabilities?.[CLIENT_CAPS.providerSubagents]
+        ) sendAuthorized(event);
+      }
       catalogSession.start();
       const detached = () => socket.close(1013, "Worker lease ended");
       function deliverPermissionEvent(event: CentralTimelineUpdate) {
@@ -647,6 +686,25 @@ export async function startRemoteCentral(options: CentralOptions) {
           }
           return;
         }
+        if (event.type === "provider_subagent") {
+          const update = orchestration.projectProviderSubagentUpdate(event.event);
+          if (update) deliverOrchestrationUpdate(update);
+          return;
+        }
+        if (event.type === "background_work") {
+          let subscribed = false;
+          for (const events of eventSubscriptions.values()) {
+            if (events.has("agent.background_work.update")) {
+              subscribed = true;
+              break;
+            }
+          }
+          if (!subscribed) return;
+          void orchestration.backgroundWorkUpdate(event.agentId).then((update) => {
+            if (update) deliverOrchestrationUpdate(update.message);
+          }).catch((err) => options.logger.warn({ err, agentId: event.agentId }, "Worker background work update failed"));
+          return;
+        }
         deliverPermissionEvent(event);
         for (const [subscriptionId, ids] of subscriptions) {
           if (!ids.has(event.payload.agentId)) continue;
@@ -689,6 +747,9 @@ export async function startRemoteCentral(options: CentralOptions) {
         for (const stop of creationSubscriptions.values()) stop();
         creationSubscriptions.clear();
         directory.close();
+        void labelsDelivery.close().catch((err) =>
+          options.logger.warn({ err }, "Worker label subscription cleanup failed"),
+        );
         stopProjectUpdates();
         catalogSession.dispose();
         terminalSession.close();
@@ -832,6 +893,7 @@ export async function startRemoteCentral(options: CentralOptions) {
           subscriptions.delete(operation.subscriptionId);
           eventSubscriptions.delete(operation.subscriptionId);
           directory.release(operation.subscriptionId);
+          await labelsDelivery.request(socket, operation, () => labelsDelivery.release(operation.subscriptionId));
           creationSubscriptions.get(operation.subscriptionId)?.();
           creationSubscriptions.delete(operation.subscriptionId);
           pluginSession.release(operation.subscriptionId);
@@ -854,6 +916,15 @@ export async function startRemoteCentral(options: CentralOptions) {
             payload: { requestId: operation.requestId, subscriptionId },
           });
           return;
+        }
+        if (isWorkspaceLabelRequest(operation)) {
+          if (operation.type === "workspace.label.list.request" && operation.subscribe &&
+            labelsDelivery.sourceRegistrationCount(socket) >= 64) {
+            throw new WorkerOperationError("worker_subscription_limit");
+          }
+          return labelsDelivery.request(socket, operation, () =>
+            handleWorkspaceLabelRequest(scope.directory.workspaceLabels, labelsDelivery, sendAuthorized, operation),
+          );
         }
         if (
           operation.type === "project.list.request" ||
@@ -895,6 +966,12 @@ export async function startRemoteCentral(options: CentralOptions) {
         }
         if (terminalSession.handles(operation)) return terminalSession.dispatch(operation);
         switch (operation.type) {
+          case "agent.provider_subagents.list.request":
+          case "agent.provider_subagents.timeline.get.request":
+          case "agent.background_work.list.request":
+          case "agent.background_work.stop.request":
+            sendAuthorized(await orchestration.dispatch(operation));
+            return;
           case "workspace.script.list.request":
           case "workspace.script.start.request":
           case "workspace.script.stop.request":
@@ -1018,10 +1095,15 @@ export async function startRemoteCentral(options: CentralOptions) {
             agentThinkingUpdate: true,
             agentForkContext: true,
             agentForkContextCursor: true,
+            providerSubagents: true,
+            projectedSubagentTimeline: true,
+            agentBackgroundWork: true,
+            agentBackgroundWorkStop: true,
             ...(scope.connection.supportsWorkspaceOperations && {
               diffSubscription: true,
               projectSuggestions: true,
               workspaceSetupObservation: true,
+              workspaceLabels: true,
               workspaceSetupRun: true,
               workspaceRecovery: true,
               workspaceArchiveUndo: true,
@@ -1174,6 +1256,10 @@ async function dispatch(
     return;
   }
   if (scope.connection.supportsWorkspaceOperations) {
+    if (message.type === "directory_suggestions_request") {
+      reply(await scope.connection.call({ kind: "directorySuggestions", request: message }));
+      return;
+    }
     const project = scope.directory.manageProject(message);
     if (project) {
       reply(await project);
